@@ -226,6 +226,8 @@ static esp_err_t _ssh_settings_erase(nvs_handle_t nvs_handle, uint8_t index) {
     nvs_erase_key(nvs_handle, nvs_key);
     ssh_settings_combine_key(index, "hk_sha256", nvs_key);
     nvs_erase_key(nvs_handle, nvs_key);
+    ssh_settings_combine_key(index, "privkey", nvs_key);
+    nvs_erase_key(nvs_handle, nvs_key);
     return ESP_OK;
 }
 
@@ -355,4 +357,101 @@ int ssh_settings_find_empty_slot(void) {
         }
     }
     return slot;
+}
+
+bool ssh_settings_has_private_key(uint8_t index) {
+    nvs_handle_t nvs_handle;
+    esp_err_t res = nvs_open(NVS_NAMESPACE, NVS_READONLY, &nvs_handle);
+    if (res != ESP_OK) {
+        return false;
+    }
+    char nvs_key[16];
+    ssh_settings_combine_key(index, "privkey", nvs_key);
+    size_t size = 0;
+    res = nvs_get_blob(nvs_handle, nvs_key, NULL, &size);
+    nvs_close(nvs_handle);
+    return (res == ESP_OK && size > 0);
+}
+
+esp_err_t ssh_settings_get_private_key(uint8_t index, uint8_t** out_buf, size_t* out_len) {
+    if (out_buf == NULL || out_len == NULL) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    nvs_handle_t nvs_handle;
+    esp_err_t res = nvs_open(NVS_NAMESPACE, NVS_READONLY, &nvs_handle);
+    if (res != ESP_OK) {
+        return res;
+    }
+
+    char nvs_key[16];
+    ssh_settings_combine_key(index, "privkey", nvs_key);
+
+    size_t size = 0;
+    res = nvs_get_blob(nvs_handle, nvs_key, NULL, &size);
+    if (res != ESP_OK) {
+        nvs_close(nvs_handle);
+        return res;
+    }
+
+    uint8_t* buf = malloc(size);
+    if (buf == NULL) {
+        nvs_close(nvs_handle);
+        return ESP_ERR_NO_MEM;
+    }
+
+    res = nvs_get_blob(nvs_handle, nvs_key, buf, &size);
+    nvs_close(nvs_handle);
+    if (res != ESP_OK) {
+        free(buf);
+        return res;
+    }
+
+    *out_buf = buf;
+    *out_len = size;
+    return ESP_OK;
+}
+
+esp_err_t ssh_settings_set_private_key(uint8_t index, const uint8_t* data, size_t len) {
+    if (data == NULL || len == 0) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    nvs_handle_t nvs_handle;
+    esp_err_t res = nvs_open(NVS_NAMESPACE, NVS_READWRITE, &nvs_handle);
+    if (res != ESP_OK) {
+        return res;
+    }
+
+    char nvs_key[16];
+    ssh_settings_combine_key(index, "privkey", nvs_key);
+    res = nvs_set_blob(nvs_handle, nvs_key, data, len);
+    if (res != ESP_OK) {
+        nvs_close(nvs_handle);
+        return res;
+    }
+
+    res = nvs_commit(nvs_handle);
+    nvs_close(nvs_handle);
+    return res;
+}
+
+esp_err_t ssh_settings_clear_private_key(uint8_t index) {
+    nvs_handle_t nvs_handle;
+    esp_err_t res = nvs_open(NVS_NAMESPACE, NVS_READWRITE, &nvs_handle);
+    if (res != ESP_OK) {
+        return res;
+    }
+
+    char nvs_key[16];
+    ssh_settings_combine_key(index, "privkey", nvs_key);
+    res = nvs_erase_key(nvs_handle, nvs_key);
+    if (res != ESP_OK && res != ESP_ERR_NVS_NOT_FOUND) {
+        nvs_close(nvs_handle);
+        return res;
+    }
+
+    res = nvs_commit(nvs_handle);
+    nvs_close(nvs_handle);
+    return res;
 }

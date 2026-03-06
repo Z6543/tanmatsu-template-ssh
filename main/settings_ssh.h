@@ -37,3 +37,9 @@ esp_err_t ssh_settings_get_host_key(uint8_t index, uint8_t out_sha256[32]);
 esp_err_t ssh_settings_set_host_key(uint8_t index, const uint8_t sha256[32]);
 esp_err_t ssh_settings_clear_host_key(uint8_t index);
 
+// Private key blob storage (for public key authentication)
+esp_err_t ssh_settings_get_private_key(uint8_t index, uint8_t** out_buf, size_t* out_len);
+esp_err_t ssh_settings_set_private_key(uint8_t index, const uint8_t* data, size_t len);
+esp_err_t ssh_settings_clear_private_key(uint8_t index);
+bool      ssh_settings_has_private_key(uint8_t index);
+
