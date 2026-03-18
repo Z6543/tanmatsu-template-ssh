@@ -54,6 +54,7 @@ static char const CHR_NL[] = "\n";
 
 // DECCKM (application cursor keys mode) - set by \e[?1h, reset by \e[?1l
 static bool decckm_mode = false;
+static bool pending_wrap = false;
 
 // F-key escape sequences (xterm style)
 // Fn+1..Fn+0 → F1..F10, Fn+hyphen → F11, Fn+equals → F12
@@ -877,6 +878,9 @@ void util_ssh(pax_buf_t* buffer, gui_theme_t* theme, ssh_settings_t* settings, u
             char* p = ssh_buffer;
             char* end = ssh_buffer + nbytes;
             while (p < end) {
+                if (*p == '\x1b') {
+                    pending_wrap = false;
+                }
                 if (*p == '\x1b' && p + 1 < end && *(p+1) == ']') {
                     // OSC sequence: ESC] ... BEL/ST - skip entirely
                     p += 2;
@@ -921,11 +925,28 @@ void util_ssh(pax_buf_t* buffer, gui_theme_t* theme, ssh_settings_t* settings, u
                             decckm_mode = true;
                         } else if (cmd == 'l' && strcmp(seq, "?1") == 0) {
                             decckm_mode = false;
-                        } else {
+                        } else if (cmd == 'm' || cmd == 'J' ||
+                                   cmd == 'K' || cmd == 'A' ||
+                                   cmd == 'B' || cmd == 'C' ||
+                                   cmd == 'D' || cmd == 'E' ||
+                                   cmd == 'F' || cmd == 'G' ||
+                                   cmd == 'n') {
+                            // Pass to console library (SGR, erase, cursor move)
                             char esc_seq[64];
-                            snprintf(esc_seq, sizeof(esc_seq), "\x1b[%s%c", seq, cmd);
+                            snprintf(esc_seq, sizeof(esc_seq),
+                                     "\x1b[%s%c", seq, cmd);
                             console_puts(&console_instance, esc_seq);
                         }
+                    }
+                } else if (*p == '\x1b' && p + 1 < end) {
+                    // Non-CSI/OSC escape sequences (e.g. ESC(B charset select)
+                    char next = *(p + 1);
+                    if (next == '(' || next == ')' || next == '*' || next == '+') {
+                        // Character set selection: ESC(X — skip 3 bytes
+                        p += (p + 2 < end) ? 3 : 2;
+                    } else {
+                        // Single-char sequences: ESC= ESC> ESCM ESC7 ESC8 ESCc etc.
+                        p += 2;
                     }
                 } else if (*p == 0x08) {
                     if (console_instance.cursor_x > 0) {
@@ -959,15 +980,35 @@ void util_ssh(pax_buf_t* buffer, gui_theme_t* theme, ssh_settings_t* settings, u
                     }
                     if (valid) {
                         char ascii = utf8_to_ascii(cp);
+                        int prev_x = console_instance.cursor_x;
                         screen_buf_track_put(&console_instance, ascii);
                         console_put(&console_instance, ascii);
+                        if (prev_x == (int)console_instance.chars_x - 1
+                            && console_instance.cursor_x == 0) {
+                            pending_wrap = true;
+                        } else {
+                            pending_wrap = false;
+                        }
                     }
                 } else if ((unsigned char)*p >= 0x80) {
                     // Stray UTF-8 continuation byte, skip
                     p++;
                 } else {
-                    screen_buf_track_put(&console_instance, *p);
-                    console_put(&console_instance, *p++);
+                    char c = *p++;
+                    if (c == '\n' && pending_wrap) {
+                        // Suppress: cursor already on next line from wrap
+                        pending_wrap = false;
+                    } else {
+                        int prev_x = console_instance.cursor_x;
+                        screen_buf_track_put(&console_instance, c);
+                        console_put(&console_instance, c);
+                        if (c >= 0x20 && prev_x == (int)console_instance.chars_x - 1
+                            && console_instance.cursor_x == 0) {
+                            pending_wrap = true;
+                        } else {
+                            pending_wrap = false;
+                        }
+                    }
                 }
             }
         } while (nbytes > 0 && (esp_timer_get_time() - read_start) < 50000);
