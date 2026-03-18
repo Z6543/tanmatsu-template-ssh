@@ -142,6 +142,66 @@ static void screen_buf_track_put(struct cons_insts_s *inst, char c) {
     }
 }
 
+static char utf8_to_ascii(uint32_t cp) {
+    if (cp >= 0x20 && cp <= 0x7e) return (char)cp;
+    switch (cp) {
+    // Box-drawing: horizontals
+    case 0x2500: case 0x2501: case 0x2504: case 0x2505:
+    case 0x2508: case 0x2509: case 0x254C: case 0x254D:
+    case 0x2550: case 0x2574: case 0x2576: case 0x2578:
+    case 0x257A: case 0x257C: case 0x257E:
+        return '-';
+    // Box-drawing: verticals
+    case 0x2502: case 0x2503: case 0x2506: case 0x2507:
+    case 0x250A: case 0x250B: case 0x254E: case 0x254F:
+    case 0x2551: case 0x2575: case 0x2577: case 0x2579:
+    case 0x257B: case 0x257D: case 0x257F:
+        return '|';
+    // Box-drawing: all corners, tees, and crosses
+    case 0x250C: case 0x250D: case 0x250E: case 0x250F:
+    case 0x2510: case 0x2511: case 0x2512: case 0x2513:
+    case 0x2514: case 0x2515: case 0x2516: case 0x2517:
+    case 0x2518: case 0x2519: case 0x251A: case 0x251B:
+    case 0x251C: case 0x251D: case 0x251E: case 0x251F:
+    case 0x2520: case 0x2521: case 0x2522: case 0x2523:
+    case 0x2524: case 0x2525: case 0x2526: case 0x2527:
+    case 0x2528: case 0x2529: case 0x252A: case 0x252B:
+    case 0x252C: case 0x252D: case 0x252E: case 0x252F:
+    case 0x2530: case 0x2531: case 0x2532: case 0x2533:
+    case 0x2534: case 0x2535: case 0x2536: case 0x2537:
+    case 0x2538: case 0x2539: case 0x253A: case 0x253B:
+    case 0x253C: case 0x253D: case 0x253E: case 0x253F:
+    case 0x2540: case 0x2541: case 0x2542: case 0x2543:
+    case 0x2544: case 0x2545: case 0x2546: case 0x2547:
+    case 0x2548: case 0x2549: case 0x254A: case 0x254B:
+    case 0x2552: case 0x2553: case 0x2554: case 0x2555:
+    case 0x2556: case 0x2557: case 0x2558: case 0x2559:
+    case 0x255A: case 0x255B: case 0x255C: case 0x255D:
+    case 0x255E: case 0x255F: case 0x2560: case 0x2561:
+    case 0x2562: case 0x2563: case 0x2564: case 0x2565:
+    case 0x2566: case 0x2567: case 0x2568: case 0x2569:
+    case 0x256A: case 0x256B: case 0x256C:
+        return '+';
+    // Block elements
+    case 0x2588: return '#';
+    case 0x2591: case 0x2592: case 0x2593: return '#';
+    // Arrows
+    case 0x2190: return '<';
+    case 0x2191: return '^';
+    case 0x2192: return '>';
+    case 0x2193: return 'v';
+    // Bullets / dots
+    case 0x2022: case 0x2023: case 0x25CF: return '*';
+    case 0x25CB: case 0x25E6: return 'o';
+    // Diamond
+    case 0x25C6: case 0x25C7: return '*';
+    // Checkmark / ballot
+    case 0x2713: case 0x2714: return 'x';
+    case 0x2717: case 0x2718: return 'X';
+    default: return '?';
+    }
+}
+
 void ssh_console_write_cb(char* str, size_t len) {
     // NOOP
 }
@@ -817,7 +877,19 @@ void util_ssh(pax_buf_t* buffer, gui_theme_t* theme, ssh_settings_t* settings, u
             char* p = ssh_buffer;
             char* end = ssh_buffer + nbytes;
             while (p < end) {
-                if (*p == '\x1b' && p + 1 < end && *(p+1) == '[') {
+                if (*p == '\x1b' && p + 1 < end && *(p+1) == ']') {
+                    // OSC sequence: ESC] ... BEL/ST - skip entirely
+                    p += 2;
+                    while (p < end) {
+                        if (*p == '\x07') { p++; break; }
+                        if (*p == '\x1b' && p + 1 < end
+                            && *(p+1) == '\\') {
+                            p += 2; break;
+                        }
+                        p++;
+                    }
+                } else if (*p == '\x1b' && p + 1 < end
+                           && *(p+1) == '[') {
                     // CSI sequence: ESC[
                     p += 2;
                     char seq[32] = {0};
@@ -866,6 +938,32 @@ void util_ssh(pax_buf_t* buffer, gui_theme_t* theme, ssh_settings_t* settings, u
                                      erase_x, erase_y,
                                      console_instance.char_width, console_instance.char_height);
                     }
+                    p++;
+                } else if ((unsigned char)*p >= 0xC0) {
+                    // UTF-8 multi-byte sequence
+                    unsigned char lead = (unsigned char)*p;
+                    int seq_len;
+                    uint32_t cp;
+                    if (lead < 0xE0)      { seq_len = 2; cp = lead & 0x1F; }
+                    else if (lead < 0xF0) { seq_len = 3; cp = lead & 0x0F; }
+                    else                  { seq_len = 4; cp = lead & 0x07; }
+                    p++;
+                    bool valid = true;
+                    for (int ub = 1; ub < seq_len && p < end; ub++) {
+                        if (((unsigned char)*p & 0xC0) != 0x80) {
+                            valid = false;
+                            break;
+                        }
+                        cp = (cp << 6) | ((unsigned char)*p & 0x3F);
+                        p++;
+                    }
+                    if (valid) {
+                        char ascii = utf8_to_ascii(cp);
+                        screen_buf_track_put(&console_instance, ascii);
+                        console_put(&console_instance, ascii);
+                    }
+                } else if ((unsigned char)*p >= 0x80) {
+                    // Stray UTF-8 continuation byte, skip
                     p++;
                 } else {
                     screen_buf_track_put(&console_instance, *p);
