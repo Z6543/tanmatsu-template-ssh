@@ -185,9 +185,12 @@ static void vt_render_row(int row, int start_col, int end_col) {
                                    &api_fg, &api_bg);
     uint32_t default_bg = vterm_color_to_pax(api_bg);
 
-    // Clear the row background in one call
-    pax_draw_rect(vt_pax_buf, default_bg, px_start, py,
-                  width, vt_char_height);
+    // Clear the row background (1 extra pixel above to cover font
+    // scaling overflow from float vt_font_size vs int vt_char_height)
+    int clear_y = (row > 0) ? py - 1 : py;
+    int clear_h = vt_char_height + ((row > 0) ? 1 : 0);
+    pax_draw_rect(vt_pax_buf, default_bg, px_start, clear_y,
+                  width, clear_h);
 
     // Draw each cell using ABI-safe color extraction
     char ch_buf[2] = {0, 0};
