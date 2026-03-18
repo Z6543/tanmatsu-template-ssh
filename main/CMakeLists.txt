@@ -16,9 +16,22 @@ idf_component_register(
 		"settings_ssh.c"
 		"menu_ssh.c"
 		"menu_ssh_edit.c"
+		"fastopen.c"
+		"sdcard.c"
+		"libvterm/src/encoding.c"
+		"libvterm/src/keyboard.c"
+		"libvterm/src/mouse.c"
+		"libvterm/src/parser.c"
+		"libvterm/src/pen.c"
+		"libvterm/src/screen.c"
+		"libvterm/src/state.c"
+		"libvterm/src/unicode.c"
+		"libvterm/src/vterm.c"
 	PRIV_REQUIRES
 		esp_lcd
 		fatfs
+		sdmmc
+		esp_driver_sdmmc
 		nvs_flash
 		bt
 		badge-bsp
@@ -28,11 +41,12 @@ idf_component_register(
 		robotman2412__pax-codecs
 		nicolaielectronics__wifi-manager
 		skuodi__libssh2_esp
-		badgeteam__terminal-emulator
 		gui
 		${extra_requires}
 	INCLUDE_DIRS
 		"."
+		"libvterm/include"
+		"libvterm/src"
 	EMBED_FILES
 		"icons/esc.png"
 		"icons/f1.png"

@@ -1,6 +1,7 @@
 //
 // Derived from badgeteam/terminal-emulator, libssh2 example code, nicolaielectronics/tanmatsu-launcher
 //
+#include <stdarg.h>
 #include <string.h>
 #include <sys/_intsup.h>
 #include <sys/stat.h>
@@ -11,7 +12,7 @@
 #include "bsp/input.h"
 #include "bsp/power.h"
 #include "common/display.h"
-#include "console.h"
+#include "esp_log.h"
 #include "driver/uart.h"
 #include "freertos/idf_additions.h"
 #include "freertos/projdefs.h"
@@ -20,6 +21,7 @@
 #include "icons.h"
 #include "message_dialog.h"
 #include "textedit.h"
+#include "pax_gfx.h"
 #include "pax_types.h"
 #include "pax_codecs.h"
 #include "tanmatsu_coprocessor.h"
@@ -32,29 +34,13 @@
 #include "lwip/sockets.h"
 #include "util_ssh.h"
 #include "settings_ssh.h"
+#include "vterm.h"
+#include "fastopen.h"
 
 extern bool wifi_stack_get_initialized(void);
 
 static char const TAG[] = "util_ssh";
 
-// Normal cursor mode sequences (CSI)
-static char const CSI_LEFT[] = "\e[D";
-static char const CSI_RIGHT[] = "\e[C";
-static char const CSI_UP[] = "\e[A";
-static char const CSI_DOWN[] = "\e[B";
-// Application cursor mode sequences (SS3) - used by mc, vim, etc.
-static char const SS3_LEFT[] = "\eOD";
-static char const SS3_RIGHT[] = "\eOC";
-static char const SS3_UP[] = "\eOA";
-static char const SS3_DOWN[] = "\eOB";
-static char const CHR_TAB[] = "\t";
-//static char const CHR_BS[] = "\b";
-static char const CHR_BS[] = "\x7f";
-static char const CHR_NL[] = "\n";
-
-// DECCKM (application cursor keys mode) - set by \e[?1h, reset by \e[?1l
-static bool decckm_mode = false;
-static bool pending_wrap = false;
 
 // F-key escape sequences (xterm style)
 // Fn+1..Fn+0 → F1..F10, Fn+hyphen → F11, Fn+equals → F12
@@ -87,65 +73,52 @@ static const char* const fkey_sequences[] = {
 
 #define BUFFER_SIZE 4096
 
-//static uint8_t       read_buffer[BUFFER_SIZE] = {0};
+// Simple status line drawing for pre-connection messages
+static pax_buf_t *status_buf = NULL;
+static int status_y = 0;
 
-struct cons_insts_s console_instance;
-
-static char *screen_buf = NULL;
-static size_t screen_cols = 0;
-static size_t screen_rows = 0;
-
-static void screen_buf_init(size_t cols, size_t rows) {
-    free(screen_buf);
-    screen_cols = cols;
-    screen_rows = rows;
-    screen_buf = malloc(cols * rows);
-    if (screen_buf) {
-        memset(screen_buf, ' ', cols * rows);
-    }
+static void status_init(pax_buf_t *buf) {
+    status_buf = buf;
+    status_y = 0;
+    pax_background(buf, 0xFF000000);
 }
 
-static void screen_buf_put(size_t x, size_t y, char c) {
-    if (screen_buf && x < screen_cols && y < screen_rows) {
-        screen_buf[y * screen_cols + x] = c;
-    }
+static void status_print(const char *fmt, ...) {
+    if (!status_buf) return;
+    char line[256];
+    va_list args;
+    va_start(args, fmt);
+    vsnprintf(line, sizeof(line), fmt, args);
+    va_end(args);
+    pax_draw_text(status_buf, 0xFF00FF00, pax_font_sky_mono,
+                  18, 0, status_y, line);
+    status_y += 20;
 }
 
-static void screen_buf_clear(void) {
-    if (screen_buf) {
-        memset(screen_buf, ' ', screen_cols * screen_rows);
-    }
-}
+// libvterm terminal emulator state
+static VTerm *vt = NULL;
+static VTermScreen *vt_screen = NULL;
+static pax_buf_t *vt_pax_buf = NULL;
+static const pax_font_t *vt_font = NULL;
+static float vt_font_size = 0;
+static int vt_char_width = 0;
+static int vt_char_height = 0;
+static int vt_cols = 0;
+static int vt_rows = 0;
+static LIBSSH2_CHANNEL *vt_ssh_channel = NULL;
 
-static void screen_buf_scroll_up(void) {
-    if (!screen_buf || screen_rows < 2) return;
-    memmove(screen_buf, screen_buf + screen_cols,
-            screen_cols * (screen_rows - 1));
-    memset(screen_buf + screen_cols * (screen_rows - 1), ' ',
-           screen_cols);
-}
+// Dirty tracking: accumulated damage rect
+static bool vt_dirty = false;
+static VTermRect vt_dirty_rect = {0, 0, 0, 0};
+static VTermPos vt_cursor_pos = {0, 0};
+static bool vt_cursor_visible = true;
+static bool vt_cursor_moved = false;
 
-static void screen_buf_track_put(struct cons_insts_s *inst, char c) {
-    if (c == '\n') {
-        if (inst->cursor_y + 1 >= inst->chars_y) {
-            screen_buf_scroll_up();
-        }
-        return;
-    }
-    if (c == '\r') return;
-    if (c == '\t') return;
-    if (c < 0x20) return;
-    screen_buf_put(inst->cursor_x, inst->cursor_y, c);
-    if (inst->cursor_x + 1 >= inst->chars_x) {
-        if (inst->cursor_y + 1 >= inst->chars_y) {
-            screen_buf_scroll_up();
-        }
-    }
-}
+pax_buf_t ssh_bg_pax_buf = {0};
 
-static char utf8_to_ascii(uint32_t cp) {
-    if (cp >= 0x20 && cp <= 0x7e) return (char)cp;
-    switch (cp) {
+static char unicode_to_ascii(uint32_t ch) {
+    if (ch >= 0x20 && ch <= 0x7e) return (char)ch;
+    switch (ch) {
     // Box-drawing: horizontals
     case 0x2500: case 0x2501: case 0x2504: case 0x2505:
     case 0x2508: case 0x2509: case 0x254C: case 0x254D:
@@ -183,33 +156,305 @@ static char utf8_to_ascii(uint32_t cp) {
     case 0x2566: case 0x2567: case 0x2568: case 0x2569:
     case 0x256A: case 0x256B: case 0x256C:
         return '+';
-    // Block elements
     case 0x2588: return '#';
     case 0x2591: case 0x2592: case 0x2593: return '#';
-    // Arrows
     case 0x2190: return '<';
     case 0x2191: return '^';
     case 0x2192: return '>';
     case 0x2193: return 'v';
-    // Bullets / dots
     case 0x2022: case 0x2023: case 0x25CF: return '*';
     case 0x25CB: case 0x25E6: return 'o';
-    // Diamond
     case 0x25C6: case 0x25C7: return '*';
-    // Checkmark / ballot
     case 0x2713: case 0x2714: return 'x';
     case 0x2717: case 0x2718: return 'X';
     default: return '?';
     }
 }
 
-void ssh_console_write_cb(char* str, size_t len) {
-    // NOOP
+static uint32_t vterm_color_to_pax(VTermColor col) {
+    if (VTERM_COLOR_IS_INDEXED(&col)) {
+        vterm_screen_convert_color_to_rgb(vt_screen, &col);
+    }
+    // Default and RGB colors both store values in .rgb fields
+    return 0xFF000000 | ((uint32_t)col.rgb.red << 16) |
+           ((uint32_t)col.rgb.green << 8) | col.rgb.blue;
 }
 
-pax_buf_t ssh_bg_pax_buf = {0};
+static void vt_render_cell(int row, int col) {
+    VTermPos pos = {.row = row, .col = col};
+    VTermScreenCell cell;
+    vterm_screen_get_cell(vt_screen, pos, &cell);
 
+    int px = vt_char_width * col;
+    int py = vt_char_height * row;
 
+    uint32_t bg = vterm_color_to_pax(cell.bg);
+    uint32_t fg = vterm_color_to_pax(cell.fg);
+    if (cell.attrs.reverse) {
+        uint32_t tmp = bg; bg = fg; fg = tmp;
+    }
+
+    pax_draw_rect(vt_pax_buf, bg, px, py,
+                  vt_char_width, vt_char_height);
+
+    uint32_t ch = cell.chars[0];
+    if (ch == 0 || ch == ' ') return;
+
+    char ascii = unicode_to_ascii(ch);
+    char str[2] = {ascii, '\0'};
+    pax_draw_text(vt_pax_buf, fg, vt_font,
+                  vt_font_size, px, py, str);
+}
+
+static void vt_mark_dirty(VTermRect rect) {
+    if (!vt_dirty) {
+        vt_dirty_rect = rect;
+        vt_dirty = true;
+    } else {
+        if (rect.start_row < vt_dirty_rect.start_row)
+            vt_dirty_rect.start_row = rect.start_row;
+        if (rect.end_row > vt_dirty_rect.end_row)
+            vt_dirty_rect.end_row = rect.end_row;
+        if (rect.start_col < vt_dirty_rect.start_col)
+            vt_dirty_rect.start_col = rect.start_col;
+        if (rect.end_col > vt_dirty_rect.end_col)
+            vt_dirty_rect.end_col = rect.end_col;
+    }
+}
+
+// Render a row cell-by-cell
+static void vt_render_row(int row, int start_col, int end_col) {
+    int py = vt_char_height * row;
+    int px_start = vt_char_width * start_col;
+    int width = vt_char_width * (end_col - start_col);
+
+    // Get default bg via API (direct struct access has ABI issues)
+    VTermColor api_fg, api_bg;
+    vterm_state_get_default_colors(vterm_obtain_state(vt),
+                                   &api_fg, &api_bg);
+    uint32_t default_bg = vterm_color_to_pax(api_bg);
+
+    // Clear the row background in one call
+    pax_draw_rect(vt_pax_buf, default_bg, px_start, py,
+                  width, vt_char_height);
+
+    // Draw each cell using ABI-safe color extraction
+    char ch_buf[2] = {0, 0};
+    for (int col = start_col; col < end_col; col++) {
+        VTermPos pos = {.row = row, .col = col};
+        VTermColor cell_fg, cell_bg;
+        uint32_t ch;
+        int reverse;
+        if (!vterm_screen_get_cell_colors(vt_screen, pos,
+                &cell_fg, &cell_bg, &ch, &reverse))
+            continue;
+
+        uint32_t bg = vterm_color_to_pax(cell_bg);
+        uint32_t fg = vterm_color_to_pax(cell_fg);
+        if (reverse) {
+            uint32_t tmp = bg; bg = fg; fg = tmp;
+        }
+
+        // Draw cell background if different from default
+        if (bg != default_bg) {
+            pax_draw_rect(vt_pax_buf, bg,
+                vt_char_width * col, py,
+                vt_char_width, vt_char_height);
+        }
+
+        // Only draw visible characters (skip spaces and empty)
+        if (ch != 0 && ch != ' ') {
+            ch_buf[0] = unicode_to_ascii(ch);
+            if (ch_buf[0] != ' ') {
+                pax_draw_text(vt_pax_buf, fg, vt_font,
+                    vt_font_size, vt_char_width * col, py,
+                    ch_buf);
+            }
+        }
+    }
+}
+
+// Render all dirty cells and draw cursor
+static void vt_render_dirty(void) {
+    if (vt_dirty) {
+        for (int row = vt_dirty_rect.start_row;
+             row < vt_dirty_rect.end_row; row++) {
+            vt_render_row(row, vt_dirty_rect.start_col,
+                          vt_dirty_rect.end_col);
+        }
+        vt_dirty = false;
+    }
+    if (vt_cursor_moved) {
+        vt_cursor_moved = false;
+    }
+    if (vt_cursor_visible &&
+        vt_cursor_pos.row < vt_rows &&
+        vt_cursor_pos.col < vt_cols) {
+        int px = vt_char_width * vt_cursor_pos.col;
+        int py = vt_char_height * vt_cursor_pos.row;
+        pax_draw_line(vt_pax_buf, 0xffefefef, px, py,
+                      px, py + vt_char_height - 1);
+    }
+}
+
+static int vt_on_damage(VTermRect rect, void *user) {
+    (void)user;
+    vt_mark_dirty(rect);
+    return 1;
+}
+
+static int vt_on_moverect(VTermRect dest, VTermRect src, void *user) {
+    (void)user;
+    vt_mark_dirty(dest);
+    vt_mark_dirty(src);
+    return 1;
+}
+
+static int vt_on_movecursor(VTermPos pos, VTermPos oldpos,
+                            int visible, void *user) {
+    (void)user;
+    // Mark old cursor position dirty so it gets redrawn
+    VTermRect old_r = {oldpos.row, oldpos.row + 1,
+                       oldpos.col, oldpos.col + 1};
+    vt_mark_dirty(old_r);
+    vt_cursor_pos = pos;
+    vt_cursor_visible = visible;
+    vt_cursor_moved = true;
+    return 1;
+}
+
+static int vt_on_settermprop(VTermProp prop, VTermValue *val,
+                             void *user) {
+    (void)user;
+    (void)val;
+    if (prop == VTERM_PROP_ALTSCREEN) {
+        VTermRect full = {0, vt_rows, 0, vt_cols};
+        vt_mark_dirty(full);
+    }
+    return 1;
+}
+
+static int vt_on_bell(void *user) { (void)user; return 1; }
+static int vt_on_resize(int rows, int cols, void *user) {
+    (void)user; (void)rows; (void)cols; return 1;
+}
+
+static VTermScreenCallbacks vt_screen_cbs = {
+    .damage = vt_on_damage,
+    .moverect = vt_on_moverect,
+    .movecursor = vt_on_movecursor,
+    .settermprop = vt_on_settermprop,
+    .bell = vt_on_bell,
+    .resize = vt_on_resize,
+};
+
+static void vt_output_cb(const char *s, size_t len, void *user) {
+    (void)user;
+    if (vt_ssh_channel) {
+        libssh2_channel_write(vt_ssh_channel, s, len);
+    }
+}
+
+static void vt_init(int rows, int cols) {
+    if (vt) vterm_free(vt);
+    vt = vterm_new(rows, cols);
+    vterm_set_utf8(vt, 1);
+    vt_screen = vterm_obtain_screen(vt);
+    vterm_screen_set_callbacks(vt_screen, &vt_screen_cbs, NULL);
+    vterm_screen_set_damage_merge(vt_screen, VTERM_DAMAGE_SCROLL);
+    vterm_screen_enable_altscreen(vt_screen, 1);
+    vterm_screen_reset(vt_screen, 1);
+
+    VTermColor fg, bg;
+    vterm_color_rgb(&fg, 0x00, 0xff, 0x00);
+    vterm_color_rgb(&bg, 0x00, 0x00, 0x00);
+    vterm_screen_set_default_colors(vt_screen, &fg, &bg);
+
+    vterm_output_set_callback(vt, vt_output_cb, NULL);
+    vt_cols = cols;
+    vt_rows = rows;
+}
+
+static void vt_render_full(void) {
+    pax_draw_rect(vt_pax_buf, 0xff000000, 0, 0,
+                  pax_buf_get_width(vt_pax_buf),
+                  pax_buf_get_height(vt_pax_buf));
+    if (ssh_bg_pax_buf.width > 0) {
+        pax_draw_image(vt_pax_buf, &ssh_bg_pax_buf, 0, 0);
+    }
+    for (int row = 0; row < vt_rows; row++) {
+        vt_render_row(row, 0, vt_cols);
+    }
+}
+
+static void vt_compute_size(const pax_font_t *font, float mult) {
+    pax_buf_t *buf = display_get_buffer();
+    vt_font = font;
+    vt_font_size = font->default_size * mult;
+    vt_char_width = font->ranges->bitmap_mono.width * mult;
+    vt_char_height = font->ranges->bitmap_mono.height * mult;
+    vt_cols = pax_buf_get_width(buf) / vt_char_width;
+    vt_rows = pax_buf_get_height(buf) / vt_char_height;
+}
+
+static void screenshot_to_uart(void) {
+    ESP_LOGI(TAG, "=== SCREENSHOT START ===");
+    if (!vt_screen) {
+        ESP_LOGE(TAG, "screenshot: no vterm screen");
+        ESP_LOGI(TAG, "=== SCREENSHOT END ===");
+        return;
+    }
+    char *line = malloc(vt_cols + 1);
+    if (!line) {
+        ESP_LOGE(TAG, "screenshot: alloc failed");
+        return;
+    }
+    for (int y = 0; y < vt_rows; y++) {
+        VTermRect rect = {y, y + 1, 0, vt_cols};
+        size_t len = vterm_screen_get_text(vt_screen, line,
+                                           vt_cols, rect);
+        while (len > 0 && line[len - 1] == ' ') len--;
+        line[len] = '\0';
+        ESP_LOGI(TAG, "|%s", line);
+    }
+    free(line);
+    ESP_LOGI(TAG, "=== SCREENSHOT END ===");
+}
+
+static void save_screenshot(void) {
+    if (!vt_pax_buf) return;
+
+    time_t t = time(NULL);
+    struct tm *tm_info = localtime(&t);
+    char filename[64];
+    snprintf(filename, sizeof(filename),
+        "/sd/ssh-%04d%02d%02d%02d%02d%02d.ppm",
+        tm_info->tm_year + 1900, tm_info->tm_mon + 1,
+        tm_info->tm_mday, tm_info->tm_hour,
+        tm_info->tm_min, tm_info->tm_sec);
+
+    FILE *f = fastopen(filename, "wb");
+    if (f == NULL) {
+        ESP_LOGW(TAG, "Cannot save screenshot (SD not mounted?)");
+        return;
+    }
+
+    size_t w = pax_buf_get_width(vt_pax_buf);
+    size_t h = pax_buf_get_height(vt_pax_buf);
+    fprintf(f, "P6\n%zu %zu\n255\n", w, h);
+
+    for (size_t y = 0; y < h; y++) {
+        for (size_t x = 0; x < w; x++) {
+            pax_col_t col = pax_get_pixel(vt_pax_buf, x, y);
+            fputc((col >> 16) & 0xFF, f);
+            fputc((col >> 8) & 0xFF, f);
+            fputc(col & 0xFF, f);
+        }
+    }
+
+    fastclose(f);
+    ESP_LOGI(TAG, "Screenshot saved: %s", filename);
+}
 
 static bool load_ssh_bg(void) {
     int backgrounds = 0;
@@ -217,8 +462,7 @@ static bool load_ssh_bg(void) {
     DIR *d;
     struct dirent *dir;
     char bgfilename[PATH_MAX];
-    
-    //ESP_LOGI(TAG, "trying to opendir(/sd/bg)`");
+
     d = opendir("/sd/bg");
     if (!d) {
 	ESP_LOGI(TAG, "no background images directory found");
@@ -227,33 +471,30 @@ static bool load_ssh_bg(void) {
 
     while ((dir = readdir(d)) != NULL) {
         if (dir->d_type==DT_REG) {
-            //ESP_LOGI(TAG, "found file %s\n", dir->d_name);
             backgrounds++;
         }
     }
     closedir(d);
-    
+
     if (backgrounds == 0) {
 	ESP_LOGI(TAG, "background images directory was empty - nothing loaded");
 	return false;
     }
 
-    //ESP_LOGI(TAG, "choosing a random background from %d", backgrounds + 1);
     randbgno = rand() % (backgrounds + 1);
-    //ESP_LOGI(TAG, "picked number %d", randbgno);
     sprintf(bgfilename, "/sd/bg/%02d.png", randbgno);
-    //ESP_LOGI(TAG, "which is filename %s", bgfilename);
 
-    FILE* fd = fopen(bgfilename, "rb");
+    FILE* fd = fastopen(bgfilename, "rb");
     if (fd == NULL) {
         ESP_LOGE(TAG, "Failed to open background image file");
         return false;
     }
-    if (!pax_decode_png_fd(&ssh_bg_pax_buf, fd, PAX_BUF_32_8888ARGB, 0)) {  // CODEC_FLAG_EXISTING)) {
+    if (!pax_decode_png_fd(&ssh_bg_pax_buf, fd, PAX_BUF_32_8888ARGB, 0)) {
         ESP_LOGE(TAG, "Failed to decode png file");
+        fastclose(fd);
         return false;
     }
-    fclose(fd);
+    fastclose(fd);
     return true;
 }
 
@@ -267,31 +508,6 @@ static void keyboard_backlight(void) {
     }
     ESP_LOGI(TAG, "Keyboard brightness: %u%%\r\n", brightness);
     bsp_input_set_backlight_brightness(brightness);
-}
-
-static void screenshot_to_uart(struct cons_insts_s *inst) {
-    ESP_LOGI(TAG, "=== SCREENSHOT START ===");
-    if (!screen_buf) {
-        ESP_LOGE(TAG, "screenshot: screen buffer not allocated");
-        ESP_LOGI(TAG, "=== SCREENSHOT END ===");
-        return;
-    }
-    char *line = malloc(screen_cols + 1);
-    if (!line) {
-        ESP_LOGE(TAG, "screenshot: failed to allocate line buffer");
-        return;
-    }
-    for (size_t y = 0; y < screen_rows; y++) {
-        memcpy(line, screen_buf + y * screen_cols, screen_cols);
-        size_t len = screen_cols;
-        while (len > 0 && line[len - 1] == ' ') {
-            len--;
-        }
-        line[len] = '\0';
-        ESP_LOGI(TAG, "|%s", line);
-    }
-    free(line);
-    ESP_LOGI(TAG, "=== SCREENSHOT END ===");
 }
 
 static void display_backlight(void) {
@@ -310,13 +526,6 @@ void util_ssh(pax_buf_t* buffer, gui_theme_t* theme, ssh_settings_t* settings, u
     QueueHandle_t input_event_queue = NULL;
     ESP_ERROR_CHECK(bsp_input_get_queue(&input_event_queue));
 
-    struct cons_config_s con_conf = {
-        .font = pax_font_sky_mono, 
-	.font_size_mult = 1.5, 
-	.paxbuf = display_get_buffer(), 
-	.output_cb = ssh_console_write_cb
-    };
-
     ssize_t nbytes; // bytes read from ssh server
     int rc; // return code from libssh2 library calls
     int i;
@@ -333,21 +542,12 @@ void util_ssh(pax_buf_t* buffer, gui_theme_t* theme, ssh_settings_t* settings, u
     size_t ssh_hostkey_len;
     int ssh_hostkey_type;
     char *ssh_userauthlist = '\0';
-    int cx = 0; // old cursor x position
-    int cy = 0; // old cursor y position
-    int ocx = 0; // old cursor x position
-    int ocy = 0; // old cursor y position
+    static float font_size_mult = 1.5;
 
-    console_init(&console_instance, &con_conf);
-    screen_buf_init(console_instance.chars_x, console_instance.chars_y);
-    //console_set_colors(&console_instance, CONS_COL_VGA_GREEN, CONS_COL_VGA_BLACK);
-    console_instance.fg = 0xff00ff00;
-    console_instance.bg = 0xff000000;
-    decckm_mode = false;
+    status_init(buffer);
     keyboard_backlight();
 
-    //busy_dialog(get_icon(ICON_TERMINAL), "SSH", "Connecting to WiFi...");
-    console_printf(&console_instance, "\nConnecting to WiFi...\n");
+    status_print("Connecting to WiFi...");
     display_blit_buffer(buffer);
 
     if (!wifi_stack_get_initialized()) {
@@ -364,8 +564,7 @@ void util_ssh(pax_buf_t* buffer, gui_theme_t* theme, ssh_settings_t* settings, u
         }
     }
 
-    //ESP_LOGI(TAG, "initialising libssh2");
-    console_printf(&console_instance, "Initialising libssh2...\n");
+    status_print("Initialising libssh2...\n");
     display_blit_buffer(buffer);
     rc = libssh2_init(0);
     if (rc) {
@@ -374,28 +573,22 @@ void util_ssh(pax_buf_t* buffer, gui_theme_t* theme, ssh_settings_t* settings, u
     }
 
     ESP_LOGI(TAG, "setting up destination host IP address and port");
-    // TODO: check if any changes needed for IPv6 support
-    // TODO: check if any changes needed for DNS lookup of hostnames
     inet_pton(AF_INET, settings->dest_host, &ssh_addr.sin_addr);
     ssh_addr.sin_port = htons(atoi(settings->dest_port));
     ssh_addr.sin_family = AF_INET;
 
     ESP_LOGI(TAG, "creating socket to use for ssh session");
     ssh_sock = socket(AF_INET, SOCK_STREAM, 0);
-    /*if (ssh_sock == LIBSSH2_INVALID_SOCKET) {
-        ESP_LOGE(TAG, "failed to create socket");
-        return;
-    }*/
 
     ESP_LOGI(TAG, "connecting...");
-    console_printf(&console_instance, "Connecting...\n");
+    status_print("Connecting...\n");
     display_blit_buffer(buffer);
     if (connect(ssh_sock, (struct sockaddr*)&ssh_addr, sizeof(ssh_addr))) {
         ESP_LOGE(TAG, "failed to connect.");
         return;
     }
 
-    console_printf(&console_instance, "Starting SSH session...\n");
+    status_print("Starting SSH session...\n");
     display_blit_buffer(buffer);
     ESP_LOGI(TAG, "initialising session");
     ssh_session = libssh2_session_init();
@@ -404,14 +597,8 @@ void util_ssh(pax_buf_t* buffer, gui_theme_t* theme, ssh_settings_t* settings, u
         return;
     }
 
-    // XXX we can do verbose ssh debugging if needed... 
-    //libssh2_trace(ssh_session, ~0);
-    // TODO: display server banner?
-    // TODO: display the info we're currently logging about connection setup
-    // TODO: condense multiple dialogs at connection time down to one
-
     ESP_LOGI(TAG, "session handshake");
-    console_printf(&console_instance, "Session handshake...\n");
+    status_print("Session handshake...\n");
     rc = libssh2_session_handshake(ssh_session, ssh_sock);
     if (rc) {
         ESP_LOGE(TAG, "failure establishing SSH session: %d", rc);
@@ -420,7 +607,7 @@ void util_ssh(pax_buf_t* buffer, gui_theme_t* theme, ssh_settings_t* settings, u
 
     // Fetch and verify host key
     ESP_LOGI(TAG, "fetching destination host key");
-    console_printf(&console_instance, "Fetching host key...\n");
+    status_print("Fetching host key...\n");
     display_blit_buffer(buffer);
     ssh_hostkey = libssh2_session_hostkey(ssh_session, &ssh_hostkey_len, &ssh_hostkey_type);
     if (!ssh_hostkey) {
@@ -435,7 +622,6 @@ void util_ssh(pax_buf_t* buffer, gui_theme_t* theme, ssh_settings_t* settings, u
 
     ESP_LOGI(TAG, "remote host key len: %d, type: %d", (int)ssh_hostkey_len, ssh_hostkey_type);
 
-    // Get SHA256 fingerprint for display and storage
     const char *sha256_hash = libssh2_hostkey_hash(ssh_session, LIBSSH2_HOSTKEY_HASH_SHA256);
     if (!sha256_hash) {
         ESP_LOGE(TAG, "failed to compute host key SHA256 hash");
@@ -447,7 +633,6 @@ void util_ssh(pax_buf_t* buffer, gui_theme_t* theme, ssh_settings_t* settings, u
         return;
     }
 
-    // Format printable fingerprint (SHA256)
     bzero(ssh_printable_fingerprint, sizeof(ssh_printable_fingerprint));
     char* j = ssh_printable_fingerprint;
     for (i = 0; i < 32; i++) {
@@ -456,25 +641,22 @@ void util_ssh(pax_buf_t* buffer, gui_theme_t* theme, ssh_settings_t* settings, u
         if (i < 31) { *j++ = ':'; }
     }
     ESP_LOGI(TAG, "Host key SHA256 fingerprint: %s", ssh_printable_fingerprint);
-    console_printf(&console_instance, "SHA256: %s\n", ssh_printable_fingerprint);
+    status_print("SHA256: %s\n", ssh_printable_fingerprint);
     display_blit_buffer(buffer);
 
-    // Check host key against saved fingerprint in NVS
     ESP_LOGI(TAG, "checking host key against saved fingerprint");
-    console_printf(&console_instance, "Checking saved host key...\n");
+    status_print("Checking saved host key...\n");
     display_blit_buffer(buffer);
 
     uint8_t saved_sha256[32] = {0};
     esp_err_t hk_res = ssh_settings_get_host_key(connection_index, saved_sha256);
 
     if (hk_res == ESP_OK) {
-        // We have a saved fingerprint - compare
         if (memcmp(saved_sha256, sha256_hash, 32) == 0) {
             ESP_LOGI(TAG, "host key matches saved fingerprint");
-            console_printf(&console_instance, "Host key verified.\n");
+            status_print("Host key verified.\n");
             display_blit_buffer(buffer);
         } else {
-            // MISMATCH - this is serious
             ESP_LOGW(TAG, "HOST KEY MISMATCH - possible MITM attack");
             snprintf(dialog_buffer, sizeof(dialog_buffer),
                 "WARNING: Host key has CHANGED!\n\n"
@@ -490,12 +672,10 @@ void util_ssh(pax_buf_t* buffer, gui_theme_t* theme, ssh_settings_t* settings, u
                 libssh2_exit();
                 return;
             }
-            // User accepted the new key - save it
             ESP_LOGI(TAG, "user accepted new host key, saving");
             ssh_settings_set_host_key(connection_index, (const uint8_t*)sha256_hash);
         }
     } else {
-        // No saved fingerprint - first connection to this host
         ESP_LOGI(TAG, "no saved host key, first connection");
         snprintf(dialog_buffer, sizeof(dialog_buffer),
             "New host - no saved key.\n\n"
@@ -510,7 +690,6 @@ void util_ssh(pax_buf_t* buffer, gui_theme_t* theme, ssh_settings_t* settings, u
             libssh2_exit();
             return;
         }
-        // Save the fingerprint for future connections
         ESP_LOGI(TAG, "user accepted host key, saving to NVS");
         ssh_settings_set_host_key(connection_index, (const uint8_t*)sha256_hash);
     }
@@ -521,39 +700,32 @@ void util_ssh(pax_buf_t* buffer, gui_theme_t* theme, ssh_settings_t* settings, u
     ESP_LOGI(TAG, "user auth methods check");
     ssh_userauthlist = libssh2_userauth_list(ssh_session, settings->username, (unsigned int)strlen(settings->username));
     ESP_LOGI(TAG, "user auth methods list: %s", ssh_userauthlist);
-    console_printf(&console_instance, "Host supports auth methods... %s\n", ssh_userauthlist);
+    status_print("Host supports auth methods... %s\n", ssh_userauthlist);
 
     bool authenticated = false;
 
-    // Try public key authentication first if a private key is stored
     if (ssh_settings_has_private_key(connection_index)) {
         ESP_LOGI(TAG, "private key found, attempting public key authentication");
-        console_printf(&console_instance, "Trying public key authentication...\n");
+        status_print("Trying public key authentication...\n");
         display_blit_buffer(buffer);
 
         uint8_t* privkey_data = NULL;
         size_t privkey_len = 0;
         esp_err_t key_res = ssh_settings_get_private_key(connection_index, &privkey_data, &privkey_len);
         if (key_res == ESP_OK) {
-            // Use password as passphrase for the key if one is configured
             const char* passphrase = (strlen(settings->password) > 0) ? settings->password : NULL;
-
             rc = libssh2_userauth_publickey_frommemory(
                 ssh_session, settings->username, strlen(settings->username),
-                NULL, 0,
-                (const char*)privkey_data, privkey_len,
-                passphrase);
-
+                NULL, 0, (const char*)privkey_data, privkey_len, passphrase);
             free(privkey_data);
-
             if (rc == 0) {
                 ESP_LOGI(TAG, "public key authentication succeeded");
-                console_printf(&console_instance, "Public key authentication succeeded.\n");
+                status_print("Public key authentication succeeded.\n");
                 display_blit_buffer(buffer);
                 authenticated = true;
             } else {
                 ESP_LOGW(TAG, "public key authentication failed (%d), falling back to password", rc);
-                console_printf(&console_instance, "Public key auth failed, trying password...\n");
+                status_print("Public key auth failed, trying password...\n");
                 display_blit_buffer(buffer);
             }
         } else {
@@ -561,7 +733,6 @@ void util_ssh(pax_buf_t* buffer, gui_theme_t* theme, ssh_settings_t* settings, u
         }
     }
 
-    // Fall back to password authentication if pubkey auth didn't succeed
     if (!authenticated) {
         if (strlen(settings->password) > 0) {
             ESP_LOGI(TAG, "using saved password");
@@ -589,12 +760,13 @@ void util_ssh(pax_buf_t* buffer, gui_theme_t* theme, ssh_settings_t* settings, u
 
             ESP_LOGI(TAG, "authenticating to %s:%s as user %s (attempt %d/%d)",
                      settings->dest_host, settings->dest_port, settings->username, attempt + 1, max_auth_attempts);
-            console_printf(&console_instance, "Authenticating to %s:%s as %s...\n",
+            status_print("Authenticating to %s:%s as %s...\n",
                            settings->dest_host, settings->dest_port, settings->username);
             display_blit_buffer(buffer);
 
             if (libssh2_userauth_password(ssh_session, settings->username, ssh_password) == 0) {
                 ESP_LOGI(TAG, "authentication by password succeeded");
+                authenticated = true;
                 break;
             }
 
@@ -617,25 +789,29 @@ void util_ssh(pax_buf_t* buffer, gui_theme_t* theme, ssh_settings_t* settings, u
         }
     }
 
-    // TODO: Support keyboard_interactive auth
-    // TODO: Support agent auth
+    if (!authenticated) {
+        message_dialog(get_icon(ICON_ERROR), "SSH error", "Authentication failed", "Quit");
+        goto shutdown;
+    }
 
     ESP_LOGI(TAG, "requesting session");
-    console_printf(&console_instance, "Requesting ssh session...\n");
+    status_print("Requesting ssh session...\n");
     ssh_channel = libssh2_channel_open_session(ssh_session);
     if (!ssh_channel) {
         ESP_LOGE(TAG, "unable to open a session");
         return;
     }
 
-    //ESP_LOGI(TAG, "sending env variables");
     libssh2_channel_setenv(ssh_channel, "LANG", "en_US.UTF-8");
 
+    // Compute terminal dimensions and init libvterm
+    vt_pax_buf = buffer;
+    vt_compute_size(pax_font_sky_mono, font_size_mult);
+
     ESP_LOGI(TAG, "requesting pty");
-    console_printf(&console_instance, "Requesting pseudoterminal for interactive login session...\n");
-    // Use actual terminal dimensions from the console instance
-    int pty_cols = console_instance.chars_x;
-    int pty_rows = console_instance.chars_y;
+    status_print("Requesting pseudoterminal for interactive login session...\n");
+    int pty_cols = vt_cols;
+    int pty_rows = vt_rows;
     int pty_width_px = pax_buf_get_width(buffer);
     int pty_height_px = pax_buf_get_height(buffer);
     ESP_LOGI(TAG, "PTY size: %d cols x %d rows (%d x %d px)", pty_cols, pty_rows, pty_width_px, pty_height_px);
@@ -645,7 +821,6 @@ void util_ssh(pax_buf_t* buffer, gui_theme_t* theme, ssh_settings_t* settings, u
         return;
     }
 
-    // TODO: check whether libssh2_channel_shell is required
     if (libssh2_channel_shell(ssh_channel)) {
         ESP_LOGE(TAG, "failed requesting shell");
         return;
@@ -654,15 +829,15 @@ void util_ssh(pax_buf_t* buffer, gui_theme_t* theme, ssh_settings_t* settings, u
     ESP_LOGI(TAG, "making the channel non-blocking");
     libssh2_channel_set_blocking(ssh_channel, 0);
 
-    // TODO: make background image loading into a task, so it doesn't hold everything else up
-    // TODO: see if we can find a way to stop background image from scrolling
-    // TODO: function key switches between background images?
+    // Initialize libvterm
+    vt_init(pty_rows, pty_cols);
+    vt_ssh_channel = ssh_channel;
+
     ESP_LOGI(TAG, "trying to load background image");
-    console_printf(&console_instance, "Looking for background images...\n");
     load_ssh_bg();
-    console_clear(&console_instance);
-    console_set_cursor(&console_instance, 0, 0);
-    pax_draw_image(buffer, &ssh_bg_pax_buf, 0, 0);
+
+    // Clear screen and render initial state
+    vt_render_full();
     display_blit_buffer(buffer);
 
     ESP_LOGI(TAG, "ssh setup completed, entering main loop");
@@ -676,20 +851,18 @@ void util_ssh(pax_buf_t* buffer, gui_theme_t* theme, ssh_settings_t* settings, u
     while (1) {
         bsp_input_event_t event;
         if (xQueueReceive(input_event_queue, &event, pdMS_TO_TICKS(10)) == pdTRUE) {
-            //ESP_LOGI(TAG, "input received");
             switch (event.type) {
                 case INPUT_EVENT_TYPE_KEYBOARD:
 		    ssh_out = event.args_keyboard.ascii;
-		    // Fn + number keys → send F-key escape sequences
 		    if (event.args_keyboard.modifiers & BSP_INPUT_MODIFIER_FUNCTION) {
 		        const char* fseq = NULL;
 		        if (ssh_out >= '0' && ssh_out <= '9') {
 		            int idx = ssh_out - '0';
 		            fseq = fkey_sequences[idx];
 		        } else if (ssh_out == '-') {
-		            fseq = fkey_sequences[10]; // F11
+		            fseq = fkey_sequences[10];
 		        } else if (ssh_out == '=') {
-		            fseq = fkey_sequences[11]; // F12
+		            fseq = fkey_sequences[11];
 		        }
 		        if (fseq) {
 		            libssh2_channel_write(ssh_channel, fseq, strlen(fseq));
@@ -698,12 +871,15 @@ void util_ssh(pax_buf_t* buffer, gui_theme_t* theme, ssh_settings_t* settings, u
 		    }
 		    if (event.args_keyboard.modifiers & BSP_INPUT_MODIFIER_CTRL) {
 			if (ssh_out == 'r' || ssh_out == 'R') {
-			    screenshot_to_uart(&console_instance);
+			    screenshot_to_uart();
+			    break;
+			}
+			if (ssh_out == 's' || ssh_out == 'S') {
+			    save_screenshot();
 			    break;
 			}
                         ssh_out &= 0x1f;
 		    }
-		    // Skip characters that are also handled as navigation events to avoid double-send
 		    if (ssh_out == '\t' || ssh_out == '\n' || ssh_out == '\r' || ssh_out == '\x1b' || ssh_out == '\x7f' || ssh_out == '\b') {
 		        break;
 		    }
@@ -716,144 +892,69 @@ void util_ssh(pax_buf_t* buffer, gui_theme_t* theme, ssh_settings_t* settings, u
 		    ESP_LOGI(TAG, "input is an action event");
 		    break;
 		case INPUT_EVENT_TYPE_SCANCODE:
-		    //ESP_LOGI(TAG, "input is a scancode event");
 		    break;
                 case INPUT_EVENT_TYPE_NAVIGATION:
-		    //ESP_LOGI(TAG, "input is a navigation event");
                     if (event.args_navigation.state) {
-		        //ESP_LOGI(TAG, "checking to see which navigation key/button has been pressed");
                         switch (event.args_navigation.key) {
                             case BSP_INPUT_NAVIGATION_KEY_ESC:
-				ESP_LOGI(TAG, "esc key pressed");
-				ssh_out = '\e';
-                                libssh2_channel_write(ssh_channel, &ssh_out, 1);
+				vterm_keyboard_key(vt, VTERM_KEY_ESCAPE, VTERM_MOD_NONE);
 				break;
                             case BSP_INPUT_NAVIGATION_KEY_F1:
 				ESP_LOGI(TAG, "close key pressed - returning to app launcher");
-				// TODO: ask if they really want to close the connection when they hit F1
 				goto shutdown;
                                 return;
                             case BSP_INPUT_NAVIGATION_KEY_F2:
-				ESP_LOGI(TAG, "keyboard backlight toggle");
 				keyboard_backlight();
 				break;
                             case BSP_INPUT_NAVIGATION_KEY_F3:
-				ESP_LOGI(TAG, "display backlight toggle");
 				display_backlight();
 				break;
                             case BSP_INPUT_NAVIGATION_KEY_F6:
-				ESP_LOGI(TAG, "colour randomiser");
-	        		//printf("clearing cursor visual at old cursor position... %d, %d\n", ocx, ocy);
-  	        		pax_draw_line(buffer, 0xff000000, ocx, ocy, ocx, ocy + (console_instance.char_height - 1));
-    				console_init(&console_instance, &con_conf);
-    				screen_buf_init(console_instance.chars_x, console_instance.chars_y);
-    				console_clear(&console_instance);
-                                int randfg = (rand() % 0xffffff) & 0xff000000;
-                                int randbg = (rand() % 0xffffff) & 0xff000000;
-	                        console_instance.fg = randfg;
-	                        console_instance.bg = randbg;
-				fprintf(stderr, "fg: %08x, bg: %08x\n", randfg, randbg);
-				console_set_cursor(&console_instance, 0, 0);
-				cx = cy = ocx = ocy = 0;
-  	        		pax_draw_line(buffer, 0xff000000, ocx, ocy, ocx, ocy + (console_instance.char_height - 1));
-                                libssh2_channel_write(ssh_channel, CHR_NL, 1);
-                                display_blit_buffer(buffer);
+				vterm_keyboard_key(vt, VTERM_KEY_ENTER, VTERM_MOD_NONE);
 				break;
 			    case BSP_INPUT_NAVIGATION_KEY_LEFT:
-				ESP_LOGI(TAG, "left key pressed");
-                                if (decckm_mode) {
-                                    libssh2_channel_write(ssh_channel, SS3_LEFT, strlen(SS3_LEFT));
-                                } else {
-                                    libssh2_channel_write(ssh_channel, CSI_LEFT, strlen(CSI_LEFT));
-                                }
+				vterm_keyboard_key(vt, VTERM_KEY_LEFT, VTERM_MOD_NONE);
 				break;
             		    case BSP_INPUT_NAVIGATION_KEY_RIGHT:
-				ESP_LOGI(TAG, "right key pressed");
-                                if (decckm_mode) {
-                                    libssh2_channel_write(ssh_channel, SS3_RIGHT, strlen(SS3_RIGHT));
-                                } else {
-                                    libssh2_channel_write(ssh_channel, CSI_RIGHT, strlen(CSI_RIGHT));
-                                }
+				vterm_keyboard_key(vt, VTERM_KEY_RIGHT, VTERM_MOD_NONE);
 				break;
             		    case BSP_INPUT_NAVIGATION_KEY_UP:
-				ESP_LOGI(TAG, "up key pressed");
-                                if (decckm_mode) {
-                                    libssh2_channel_write(ssh_channel, SS3_UP, strlen(SS3_UP));
-                                } else {
-                                    libssh2_channel_write(ssh_channel, CSI_UP, strlen(CSI_UP));
-                                }
+				vterm_keyboard_key(vt, VTERM_KEY_UP, VTERM_MOD_NONE);
 				break;
             		    case BSP_INPUT_NAVIGATION_KEY_DOWN:
-				ESP_LOGI(TAG, "down key pressed");
-                                if (decckm_mode) {
-                                    libssh2_channel_write(ssh_channel, SS3_DOWN, strlen(SS3_DOWN));
-                                } else {
-                                    libssh2_channel_write(ssh_channel, CSI_DOWN, strlen(CSI_DOWN));
-                                }
+				vterm_keyboard_key(vt, VTERM_KEY_DOWN, VTERM_MOD_NONE);
 				break;
             		    case BSP_INPUT_NAVIGATION_KEY_TAB:
-				ESP_LOGI(TAG, "tab key pressed");
-                                libssh2_channel_write(ssh_channel, CHR_TAB, 1);
+				vterm_keyboard_key(vt, VTERM_KEY_TAB, VTERM_MOD_NONE);
 				break;
 			    case BSP_INPUT_NAVIGATION_KEY_VOLUME_UP:
-				ESP_LOGI(TAG, "volume up key pressed");
-	        		printf("clearing cursor visual at old cursor position... %d, %d\n", ocx, ocy);
-  	        		pax_draw_line(buffer, 0xff000000, ocx, ocy, ocx, ocy + (console_instance.char_height - 1));
-                                con_conf.font_size_mult += 0.3;
-    				console_init(&console_instance, &con_conf);
-    				screen_buf_init(console_instance.chars_x, console_instance.chars_y);
-    				console_clear(&console_instance);
-				console_set_cursor(&console_instance, 0, 0);
-				cx = cy = ocx = ocy = 0;
-  	        		pax_draw_line(buffer, 0xff000000, ocx, ocy, ocx, ocy + (console_instance.char_height - 1));
-	                        console_instance.fg = 0xff00ff00;
-	                        console_instance.bg = 0x00000000;
-                                libssh2_channel_write(ssh_channel, CHR_NL, 1);
+                                font_size_mult += 0.3;
+                                vt_compute_size(pax_font_sky_mono, font_size_mult);
+                                vt_init(vt_rows, vt_cols);
+                                vt_render_full();
+                                vterm_keyboard_key(vt, VTERM_KEY_ENTER, VTERM_MOD_NONE);
                                 display_blit_buffer(buffer);
 				break;
 			    case BSP_INPUT_NAVIGATION_KEY_VOLUME_DOWN:
-				ESP_LOGI(TAG, "volume down key pressed");
-	        		//printf("clearing cursor visual at old cursor position... %d, %d\n", ocx, ocy);
-  	        		pax_draw_line(buffer, 0xff000000, ocx, ocy, ocx, ocy + (console_instance.char_height - 1));
-                                con_conf.font_size_mult -= 0.3;
-    				console_init(&console_instance, &con_conf);
-    				screen_buf_init(console_instance.chars_x, console_instance.chars_y);
-    				console_clear(&console_instance);
-				console_set_cursor(&console_instance, 0, 0);
-				cx = cy = ocx = ocy = 0;
-  	        		pax_draw_line(buffer, 0xff000000, ocx, ocy, ocx, ocy + (console_instance.char_height - 1));
-	                        console_instance.fg = 0xff00ff00;
-	                        console_instance.bg = 0x00000000;
-                                libssh2_channel_write(ssh_channel, CHR_NL, 1);
+                                font_size_mult -= 0.3;
+                                vt_compute_size(pax_font_sky_mono, font_size_mult);
+                                vt_init(vt_rows, vt_cols);
+                                vt_render_full();
+                                vterm_keyboard_key(vt, VTERM_KEY_ENTER, VTERM_MOD_NONE);
                                 display_blit_buffer(buffer);
 				break;
             		    case BSP_INPUT_NAVIGATION_KEY_BACKSPACE:
-				ESP_LOGI(TAG, "backspace key pressed");
-                                rc = libssh2_channel_write(ssh_channel, CHR_BS, 1);
+				vterm_keyboard_key(vt, VTERM_KEY_BACKSPACE, VTERM_MOD_NONE);
                                 break;
                             case BSP_INPUT_NAVIGATION_KEY_RETURN:
-				ESP_LOGI(TAG, "return key pressed");
-	        		//printf("clearing cursor visual at old cursor position... %d, %d\n", ocx, ocy);
-  	        		pax_draw_line(buffer, 0xff000000, ocx, ocy, ocx, ocy + (console_instance.char_height - 1));
-    				//ESP_LOGI(TAG, "redrawing background image");
-				// XXX this is too slow to do every time return is pressed
-				//pax_draw_image(buffer, &ssh_bg_pax_buf, 0, 0);
-                                libssh2_channel_write(ssh_channel, CHR_NL, 1);
+				vterm_keyboard_key(vt, VTERM_KEY_ENTER, VTERM_MOD_NONE);
                                 break;
-			    // TODO: handle control key combinations
-			    // TODO: improve escape character processing so we can use vi, emacs etc
-			    // TODO: light/dark mode - maybe use a function key to toggle through several presets?
-                            // TODO: font size +/-
-                            // TODO: stretch goal: themes - fg/bg colours, fonts, text size
-                            // TODO: connect/disconnect cleanly - code can be cribbed from libssh2 ssh2_exec demo
-                            // TODO: change wifi network? or maybe tie wifi network to ssh connection details
                             default:
-				ESP_LOGI(TAG, "some other navigation key has been pressed");
                                 break;
                         }
-			default:
-			    break;
 		    }
+		default:
+		    break;
 		case INPUT_EVENT_TYPE_LAST:
 		    break;
 	    }
@@ -865,176 +966,30 @@ void util_ssh(pax_buf_t* buffer, gui_theme_t* theme, ssh_settings_t* settings, u
             break;
         }
 
-        // Read available data from SSH channel, batching into a single display
-        // update. Cap at ~50ms to keep the screen responsive during large output.
+        // Feed SSH data directly to libvterm
         bool got_data = false;
         int64_t read_start = esp_timer_get_time();
         do {
             nbytes = libssh2_channel_read(ssh_channel, ssh_buffer, 8192);
             if (nbytes <= 0) break;
             got_data = true;
-
-            // Parse ANSI escape sequences
-            char* p = ssh_buffer;
-            char* end = ssh_buffer + nbytes;
-            while (p < end) {
-                if (*p == '\x1b') {
-                    pending_wrap = false;
-                }
-                if (*p == '\x1b' && p + 1 < end && *(p+1) == ']') {
-                    // OSC sequence: ESC] ... BEL/ST - skip entirely
-                    p += 2;
-                    while (p < end) {
-                        if (*p == '\x07') { p++; break; }
-                        if (*p == '\x1b' && p + 1 < end
-                            && *(p+1) == '\\') {
-                            p += 2; break;
-                        }
-                        p++;
-                    }
-                } else if (*p == '\x1b' && p + 1 < end
-                           && *(p+1) == '[') {
-                    // CSI sequence: ESC[
-                    p += 2;
-                    char seq[32] = {0};
-                    int si = 0;
-                    while (p < end && si < 31) {
-                        if ((*p >= '0' && *p <= '9') || *p == ';' || *p == '?') {
-                            seq[si++] = *p++;
-                        } else {
-                            break;
-                        }
-                    }
-                    if (p < end) {
-                        char cmd = *p++;
-                        if (cmd == 'J' && strcmp(seq, "2") == 0) {
-                            screen_buf_clear();
-                            console_clear(&console_instance);
-                            pax_draw_rect(buffer, 0xff000000, 0, 0,
-                                          pax_buf_get_width(buffer), pax_buf_get_height(buffer));
-                            if (ssh_bg_pax_buf.width > 0) {
-                                pax_draw_image(buffer, &ssh_bg_pax_buf, 0, 0);
-                            }
-                            console_set_cursor(&console_instance, 0, 0);
-                            cx = cy = ocx = ocy = 0;
-                        } else if (cmd == 'H' || cmd == 'f') {
-                            int row = 1, col = 1;
-                            if (seq[0]) sscanf(seq, "%d;%d", &row, &col);
-                            console_set_cursor(&console_instance, col - 1, row - 1);
-                        } else if (cmd == 'h' && strcmp(seq, "?1") == 0) {
-                            decckm_mode = true;
-                        } else if (cmd == 'l' && strcmp(seq, "?1") == 0) {
-                            decckm_mode = false;
-                        } else if (cmd == 'm' || cmd == 'J' ||
-                                   cmd == 'K' || cmd == 'A' ||
-                                   cmd == 'B' || cmd == 'C' ||
-                                   cmd == 'D' || cmd == 'E' ||
-                                   cmd == 'F' || cmd == 'G' ||
-                                   cmd == 'n') {
-                            // Pass to console library (SGR, erase, cursor move)
-                            char esc_seq[64];
-                            snprintf(esc_seq, sizeof(esc_seq),
-                                     "\x1b[%s%c", seq, cmd);
-                            console_puts(&console_instance, esc_seq);
-                        }
-                    }
-                } else if (*p == '\x1b' && p + 1 < end) {
-                    // Non-CSI/OSC escape sequences (e.g. ESC(B charset select)
-                    char next = *(p + 1);
-                    if (next == '(' || next == ')' || next == '*' || next == '+') {
-                        // Character set selection: ESC(X — skip 3 bytes
-                        p += (p + 2 < end) ? 3 : 2;
-                    } else {
-                        // Single-char sequences: ESC= ESC> ESCM ESC7 ESC8 ESCc etc.
-                        p += 2;
-                    }
-                } else if (*p == 0x08) {
-                    if (console_instance.cursor_x > 0) {
-                        console_instance.cursor_x--;
-                        screen_buf_put(console_instance.cursor_x,
-                                       console_instance.cursor_y, ' ');
-                        int erase_x = console_instance.char_width * console_instance.cursor_x;
-                        int erase_y = console_instance.char_height * console_instance.cursor_y;
-                        pax_draw_rect(buffer, console_instance.bg,
-                                     erase_x, erase_y,
-                                     console_instance.char_width, console_instance.char_height);
-                    }
-                    p++;
-                } else if ((unsigned char)*p >= 0xC0) {
-                    // UTF-8 multi-byte sequence
-                    unsigned char lead = (unsigned char)*p;
-                    int seq_len;
-                    uint32_t cp;
-                    if (lead < 0xE0)      { seq_len = 2; cp = lead & 0x1F; }
-                    else if (lead < 0xF0) { seq_len = 3; cp = lead & 0x0F; }
-                    else                  { seq_len = 4; cp = lead & 0x07; }
-                    p++;
-                    bool valid = true;
-                    for (int ub = 1; ub < seq_len && p < end; ub++) {
-                        if (((unsigned char)*p & 0xC0) != 0x80) {
-                            valid = false;
-                            break;
-                        }
-                        cp = (cp << 6) | ((unsigned char)*p & 0x3F);
-                        p++;
-                    }
-                    if (valid) {
-                        char ascii = utf8_to_ascii(cp);
-                        int prev_x = console_instance.cursor_x;
-                        screen_buf_track_put(&console_instance, ascii);
-                        console_put(&console_instance, ascii);
-                        if (prev_x == (int)console_instance.chars_x - 1
-                            && console_instance.cursor_x == 0) {
-                            pending_wrap = true;
-                        } else {
-                            pending_wrap = false;
-                        }
-                    }
-                } else if ((unsigned char)*p >= 0x80) {
-                    // Stray UTF-8 continuation byte, skip
-                    p++;
-                } else {
-                    char c = *p++;
-                    if (c == '\n' && pending_wrap) {
-                        // Suppress: cursor already on next line from wrap
-                        pending_wrap = false;
-                    } else {
-                        int prev_x = console_instance.cursor_x;
-                        screen_buf_track_put(&console_instance, c);
-                        console_put(&console_instance, c);
-                        if (c >= 0x20 && prev_x == (int)console_instance.chars_x - 1
-                            && console_instance.cursor_x == 0) {
-                            pending_wrap = true;
-                        } else {
-                            pending_wrap = false;
-                        }
-                    }
-                }
-            }
+            vterm_input_write(vt, ssh_buffer, nbytes);
         } while (nbytes > 0 && (esp_timer_get_time() - read_start) < 50000);
 
         if (got_data) {
-            // Draw cursor
-            cx = console_instance.char_width * console_instance.cursor_x;
-            cy = console_instance.char_height * console_instance.cursor_y;
-            if (ocx != 0 || ocy != 0) {
-                pax_draw_line(buffer, 0xff000000, ocx, ocy, ocx, ocy + (console_instance.char_height - 1));
-            }
-            ocx = cx;
-            ocy = cy;
-            pax_draw_line(buffer, 0xffefefef, cx, cy, cx, cy + (console_instance.char_height - 1));
-
+            vterm_screen_flush_damage(vt_screen);
+            vt_render_dirty();
             display_blit_buffer(buffer);
         }
     }
- 
+
     // closing the ssh connection and freeing resources
-    // could be due to user action, or an error
  shutdown:
     ESP_LOGI(TAG, "in shutdown, clearing the screen...");
     pax_draw_rect(buffer, 0xffefefef, 0, 0, 800, 480);
     display_blit_buffer(buffer);
     ESP_LOGI(TAG, "freeing memory...");
+    vt_ssh_channel = NULL;
     libssh2_channel_send_eof(ssh_channel);
     libssh2_channel_close(ssh_channel);
     libssh2_session_disconnect(ssh_session, "User closed session");
@@ -1045,6 +1000,9 @@ void util_ssh(pax_buf_t* buffer, gui_theme_t* theme, ssh_settings_t* settings, u
     }
     libssh2_exit();
     free(ssh_buffer);
-    free(screen_buf);
-    screen_buf = NULL;
+    if (vt) {
+        vterm_free(vt);
+        vt = NULL;
+        vt_screen = NULL;
+    }
 }

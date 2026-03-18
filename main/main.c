@@ -15,6 +15,7 @@
 #include "wifi_connection.h"
 #include "wifi_remote.h"
 #include "menu_ssh.h"
+#include "sdcard.h"
 
 static char const TAG[] = "main";
 
@@ -66,6 +67,12 @@ void app_main(void) {
 
     // Initialize theme
     theme_initialize();
+
+    // Mount SD card (optional, for screenshots and background images)
+    esp_err_t sd_res = sdcard_init();
+    if (sd_res != ESP_OK) {
+        ESP_LOGW(TAG, "SD card not available: %s", esp_err_to_name(sd_res));
+    }
 
     pax_buf_t* fb = display_get_buffer();
 
