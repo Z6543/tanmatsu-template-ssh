@@ -90,6 +90,58 @@ static const char* const fkey_sequences[] = {
 
 struct cons_insts_s console_instance;
 
+static char *screen_buf = NULL;
+static size_t screen_cols = 0;
+static size_t screen_rows = 0;
+
+static void screen_buf_init(size_t cols, size_t rows) {
+    free(screen_buf);
+    screen_cols = cols;
+    screen_rows = rows;
+    screen_buf = malloc(cols * rows);
+    if (screen_buf) {
+        memset(screen_buf, ' ', cols * rows);
+    }
+}
+
+static void screen_buf_put(size_t x, size_t y, char c) {
+    if (screen_buf && x < screen_cols && y < screen_rows) {
+        screen_buf[y * screen_cols + x] = c;
+    }
+}
+
+static void screen_buf_clear(void) {
+    if (screen_buf) {
+        memset(screen_buf, ' ', screen_cols * screen_rows);
+    }
+}
+
+static void screen_buf_scroll_up(void) {
+    if (!screen_buf || screen_rows < 2) return;
+    memmove(screen_buf, screen_buf + screen_cols,
+            screen_cols * (screen_rows - 1));
+    memset(screen_buf + screen_cols * (screen_rows - 1), ' ',
+           screen_cols);
+}
+
+static void screen_buf_track_put(struct cons_insts_s *inst, char c) {
+    if (c == '\n') {
+        if (inst->cursor_y + 1 >= inst->chars_y) {
+            screen_buf_scroll_up();
+        }
+        return;
+    }
+    if (c == '\r') return;
+    if (c == '\t') return;
+    if (c < 0x20) return;
+    screen_buf_put(inst->cursor_x, inst->cursor_y, c);
+    if (inst->cursor_x + 1 >= inst->chars_x) {
+        if (inst->cursor_y + 1 >= inst->chars_y) {
+            screen_buf_scroll_up();
+        }
+    }
+}
+
 void ssh_console_write_cb(char* str, size_t len) {
     // NOOP
 }
@@ -156,6 +208,31 @@ static void keyboard_backlight(void) {
     bsp_input_set_backlight_brightness(brightness);
 }
 
+static void screenshot_to_uart(struct cons_insts_s *inst) {
+    ESP_LOGI(TAG, "=== SCREENSHOT START ===");
+    if (!screen_buf) {
+        ESP_LOGE(TAG, "screenshot: screen buffer not allocated");
+        ESP_LOGI(TAG, "=== SCREENSHOT END ===");
+        return;
+    }
+    char *line = malloc(screen_cols + 1);
+    if (!line) {
+        ESP_LOGE(TAG, "screenshot: failed to allocate line buffer");
+        return;
+    }
+    for (size_t y = 0; y < screen_rows; y++) {
+        memcpy(line, screen_buf + y * screen_cols, screen_cols);
+        size_t len = screen_cols;
+        while (len > 0 && line[len - 1] == ' ') {
+            len--;
+        }
+        line[len] = '\0';
+        ESP_LOGI(TAG, "|%s", line);
+    }
+    free(line);
+    ESP_LOGI(TAG, "=== SCREENSHOT END ===");
+}
+
 static void display_backlight(void) {
     uint8_t brightness;
     bsp_display_get_backlight_brightness(&brightness);
@@ -201,6 +278,7 @@ void util_ssh(pax_buf_t* buffer, gui_theme_t* theme, ssh_settings_t* settings, u
     int ocy = 0; // old cursor y position
 
     console_init(&console_instance, &con_conf);
+    screen_buf_init(console_instance.chars_x, console_instance.chars_y);
     //console_set_colors(&console_instance, CONS_COL_VGA_GREEN, CONS_COL_VGA_BLACK);
     console_instance.fg = 0xff00ff00;
     console_instance.bg = 0xff000000;
@@ -558,6 +636,10 @@ void util_ssh(pax_buf_t* buffer, gui_theme_t* theme, ssh_settings_t* settings, u
 		        }
 		    }
 		    if (event.args_keyboard.modifiers & BSP_INPUT_MODIFIER_CTRL) {
+			if (ssh_out == 'r' || ssh_out == 'R') {
+			    screenshot_to_uart(&console_instance);
+			    break;
+			}
                         ssh_out &= 0x1f;
 		    }
 		    // Skip characters that are also handled as navigation events to avoid double-send
@@ -603,6 +685,7 @@ void util_ssh(pax_buf_t* buffer, gui_theme_t* theme, ssh_settings_t* settings, u
 	        		//printf("clearing cursor visual at old cursor position... %d, %d\n", ocx, ocy);
   	        		pax_draw_line(buffer, 0xff000000, ocx, ocy, ocx, ocy + (console_instance.char_height - 1));
     				console_init(&console_instance, &con_conf);
+    				screen_buf_init(console_instance.chars_x, console_instance.chars_y);
     				console_clear(&console_instance);
                                 int randfg = (rand() % 0xffffff) & 0xff000000;
                                 int randbg = (rand() % 0xffffff) & 0xff000000;
@@ -657,6 +740,7 @@ void util_ssh(pax_buf_t* buffer, gui_theme_t* theme, ssh_settings_t* settings, u
   	        		pax_draw_line(buffer, 0xff000000, ocx, ocy, ocx, ocy + (console_instance.char_height - 1));
                                 con_conf.font_size_mult += 0.3;
     				console_init(&console_instance, &con_conf);
+    				screen_buf_init(console_instance.chars_x, console_instance.chars_y);
     				console_clear(&console_instance);
 				console_set_cursor(&console_instance, 0, 0);
 				cx = cy = ocx = ocy = 0;
@@ -672,6 +756,7 @@ void util_ssh(pax_buf_t* buffer, gui_theme_t* theme, ssh_settings_t* settings, u
   	        		pax_draw_line(buffer, 0xff000000, ocx, ocy, ocx, ocy + (console_instance.char_height - 1));
                                 con_conf.font_size_mult -= 0.3;
     				console_init(&console_instance, &con_conf);
+    				screen_buf_init(console_instance.chars_x, console_instance.chars_y);
     				console_clear(&console_instance);
 				console_set_cursor(&console_instance, 0, 0);
 				cx = cy = ocx = ocy = 0;
@@ -747,6 +832,7 @@ void util_ssh(pax_buf_t* buffer, gui_theme_t* theme, ssh_settings_t* settings, u
                     if (p < end) {
                         char cmd = *p++;
                         if (cmd == 'J' && strcmp(seq, "2") == 0) {
+                            screen_buf_clear();
                             console_clear(&console_instance);
                             pax_draw_rect(buffer, 0xff000000, 0, 0,
                                           pax_buf_get_width(buffer), pax_buf_get_height(buffer));
@@ -772,6 +858,8 @@ void util_ssh(pax_buf_t* buffer, gui_theme_t* theme, ssh_settings_t* settings, u
                 } else if (*p == 0x08) {
                     if (console_instance.cursor_x > 0) {
                         console_instance.cursor_x--;
+                        screen_buf_put(console_instance.cursor_x,
+                                       console_instance.cursor_y, ' ');
                         int erase_x = console_instance.char_width * console_instance.cursor_x;
                         int erase_y = console_instance.char_height * console_instance.cursor_y;
                         pax_draw_rect(buffer, console_instance.bg,
@@ -780,6 +868,7 @@ void util_ssh(pax_buf_t* buffer, gui_theme_t* theme, ssh_settings_t* settings, u
                     }
                     p++;
                 } else {
+                    screen_buf_track_put(&console_instance, *p);
                     console_put(&console_instance, *p++);
                 }
             }
@@ -817,4 +906,6 @@ void util_ssh(pax_buf_t* buffer, gui_theme_t* theme, ssh_settings_t* settings, u
     }
     libssh2_exit();
     free(ssh_buffer);
+    free(screen_buf);
+    screen_buf = NULL;
 }
