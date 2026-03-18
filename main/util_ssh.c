@@ -3,9 +3,6 @@
 //
 #include <stdarg.h>
 #include <string.h>
-#include <sys/_intsup.h>
-#include <sys/stat.h>
-#include <fcntl.h>
 #include <time.h>
 #include <dirent.h>
 #include "bsp/display.h"
@@ -13,24 +10,16 @@
 #include "bsp/power.h"
 #include "common/display.h"
 #include "esp_log.h"
-#include "driver/uart.h"
 #include "freertos/idf_additions.h"
-#include "freertos/projdefs.h"
-#include "gui_element_footer.h"
-#include "gui_style.h"
 #include "icons.h"
 #include "message_dialog.h"
 #include "textedit.h"
 #include "pax_gfx.h"
-#include "pax_types.h"
 #include "pax_codecs.h"
-#include "tanmatsu_coprocessor.h"
 #include "wifi_connection.h"
 #include "esp_heap_caps.h"
-#include "esp_random.h"
 #include "esp_timer.h"
 #include <libssh2.h>
-#include "libssh2_setup.h"
 #include "lwip/sockets.h"
 #include "util_ssh.h"
 #include "settings_ssh.h"
@@ -59,19 +48,6 @@ static const char* const fkey_sequences[] = {
     [11] = "\e[24~",    // F12
 };
 
-#if defined(CONFIG_BSP_TARGET_TANMATSU) || defined(CONFIG_BSP_TARGET_KONSOOL) || \
-    defined(CONFIG_BSP_TARGET_HACKERHOTEL_2026)
-#define FOOTER_LEFT  ((gui_element_icontext_t[]){{get_icon(ICON_F5), "Settings"}, {get_icon(ICON_F6), "USB mode"}}), 2
-#define FOOTER_RIGHT ((gui_element_icontext_t[]){{NULL, "↑ / ↓ / ← / → | ⏎ Select"}}), 1
-#elif defined(CONFIG_BSP_TARGET_MCH2022)
-#define FOOTER_LEFT  NULL, 0
-#define FOOTER_RIGHT ((gui_element_icontext_t[]){{NULL, "🅰 Select"}}), 1
-#else
-#define FOOTER_LEFT  NULL, 0
-#define FOOTER_RIGHT NULL, 0
-#endif
-
-#define BUFFER_SIZE 4096
 
 // Simple status line drawing for pre-connection messages
 static pax_buf_t *status_buf = NULL;
@@ -112,7 +88,7 @@ static bool vt_dirty = false;
 static VTermRect vt_dirty_rect = {0, 0, 0, 0};
 static VTermPos vt_cursor_pos = {0, 0};
 static bool vt_cursor_visible = true;
-static bool vt_cursor_moved = false;
+
 
 pax_buf_t ssh_bg_pax_buf = {0};
 
@@ -180,31 +156,6 @@ static uint32_t vterm_color_to_pax(VTermColor col) {
            ((uint32_t)col.rgb.green << 8) | col.rgb.blue;
 }
 
-static void vt_render_cell(int row, int col) {
-    VTermPos pos = {.row = row, .col = col};
-    VTermScreenCell cell;
-    vterm_screen_get_cell(vt_screen, pos, &cell);
-
-    int px = vt_char_width * col;
-    int py = vt_char_height * row;
-
-    uint32_t bg = vterm_color_to_pax(cell.bg);
-    uint32_t fg = vterm_color_to_pax(cell.fg);
-    if (cell.attrs.reverse) {
-        uint32_t tmp = bg; bg = fg; fg = tmp;
-    }
-
-    pax_draw_rect(vt_pax_buf, bg, px, py,
-                  vt_char_width, vt_char_height);
-
-    uint32_t ch = cell.chars[0];
-    if (ch == 0 || ch == ' ') return;
-
-    char ascii = unicode_to_ascii(ch);
-    char str[2] = {ascii, '\0'};
-    pax_draw_text(vt_pax_buf, fg, vt_font,
-                  vt_font_size, px, py, str);
-}
 
 static void vt_mark_dirty(VTermRect rect) {
     if (!vt_dirty) {
@@ -284,9 +235,7 @@ static void vt_render_dirty(void) {
         }
         vt_dirty = false;
     }
-    if (vt_cursor_moved) {
-        vt_cursor_moved = false;
-    }
+
     if (vt_cursor_visible &&
         vt_cursor_pos.row < vt_rows &&
         vt_cursor_pos.col < vt_cols) {
@@ -319,7 +268,6 @@ static int vt_on_movecursor(VTermPos pos, VTermPos oldpos,
     vt_mark_dirty(old_r);
     vt_cursor_pos = pos;
     vt_cursor_visible = visible;
-    vt_cursor_moved = true;
     return 1;
 }
 
@@ -528,19 +476,17 @@ void util_ssh(pax_buf_t* buffer, gui_theme_t* theme, ssh_settings_t* settings, u
 
     ssize_t nbytes; // bytes read from ssh server
     int rc; // return code from libssh2 library calls
-    int i;
     struct sockaddr_in ssh_addr;
     char *ssh_buffer = NULL;
     char dialog_buffer[256];
     char ssh_password[128];
     LIBSSH2_SESSION *ssh_session;
-    LIBSSH2_CHANNEL *ssh_channel;
+    LIBSSH2_CHANNEL *ssh_channel = NULL;
     libssh2_socket_t ssh_sock;
     char ssh_out = '\0';
     const char *ssh_hostkey = '\0';
     char ssh_printable_fingerprint[128];
     size_t ssh_hostkey_len;
-    int ssh_hostkey_type;
     char *ssh_userauthlist = '\0';
     static float font_size_mult = 1.5;
 
@@ -609,7 +555,7 @@ void util_ssh(pax_buf_t* buffer, gui_theme_t* theme, ssh_settings_t* settings, u
     ESP_LOGI(TAG, "fetching destination host key");
     status_print("Fetching host key...\n");
     display_blit_buffer(buffer);
-    ssh_hostkey = libssh2_session_hostkey(ssh_session, &ssh_hostkey_len, &ssh_hostkey_type);
+    ssh_hostkey = libssh2_session_hostkey(ssh_session, &ssh_hostkey_len, NULL);
     if (!ssh_hostkey) {
         ESP_LOGE(TAG, "failed to get host key");
         message_dialog(get_icon(ICON_ERROR), "SSH error", "Failed to get server host key", "Quit");
@@ -620,7 +566,7 @@ void util_ssh(pax_buf_t* buffer, gui_theme_t* theme, ssh_settings_t* settings, u
         return;
     }
 
-    ESP_LOGI(TAG, "remote host key len: %d, type: %d", (int)ssh_hostkey_len, ssh_hostkey_type);
+    ESP_LOGI(TAG, "remote host key len: %d", (int)ssh_hostkey_len);
 
     const char *sha256_hash = libssh2_hostkey_hash(ssh_session, LIBSSH2_HOSTKEY_HASH_SHA256);
     if (!sha256_hash) {
@@ -635,7 +581,7 @@ void util_ssh(pax_buf_t* buffer, gui_theme_t* theme, ssh_settings_t* settings, u
 
     bzero(ssh_printable_fingerprint, sizeof(ssh_printable_fingerprint));
     char* j = ssh_printable_fingerprint;
-    for (i = 0; i < 32; i++) {
+    for (int i = 0; i < 32; i++) {
         sprintf(j, "%02X", (unsigned char)sha256_hash[i]);
         j += 2;
         if (i < 31) { *j++ = ':'; }
@@ -880,9 +826,6 @@ void util_ssh(pax_buf_t* buffer, gui_theme_t* theme, ssh_settings_t* settings, u
 			}
                         ssh_out &= 0x1f;
 		    }
-		    if (ssh_out == '\t' || ssh_out == '\n' || ssh_out == '\r' || ssh_out == '\x1b' || ssh_out == '\x7f' || ssh_out == '\b') {
-		        break;
-		    }
                     libssh2_channel_write(ssh_channel, &ssh_out, sizeof(ssh_out));
                     break;
 		case INPUT_EVENT_TYPE_NONE:
@@ -902,7 +845,6 @@ void util_ssh(pax_buf_t* buffer, gui_theme_t* theme, ssh_settings_t* settings, u
                             case BSP_INPUT_NAVIGATION_KEY_F1:
 				ESP_LOGI(TAG, "close key pressed - returning to app launcher");
 				goto shutdown;
-                                return;
                             case BSP_INPUT_NAVIGATION_KEY_F2:
 				keyboard_backlight();
 				break;
@@ -963,7 +905,6 @@ void util_ssh(pax_buf_t* buffer, gui_theme_t* theme, ssh_settings_t* settings, u
         if (libssh2_channel_eof(ssh_channel)) {
             ESP_LOGI(TAG, "server sent EOF");
             goto shutdown;
-            break;
         }
 
         // Feed SSH data directly to libvterm
@@ -990,10 +931,12 @@ void util_ssh(pax_buf_t* buffer, gui_theme_t* theme, ssh_settings_t* settings, u
     display_blit_buffer(buffer);
     ESP_LOGI(TAG, "freeing memory...");
     vt_ssh_channel = NULL;
-    libssh2_channel_send_eof(ssh_channel);
-    libssh2_channel_close(ssh_channel);
+    if (ssh_channel) {
+        libssh2_channel_send_eof(ssh_channel);
+        libssh2_channel_close(ssh_channel);
+        libssh2_channel_free(ssh_channel);
+    }
     libssh2_session_disconnect(ssh_session, "User closed session");
-    libssh2_channel_free(ssh_channel);
     if (ssh_sock != LIBSSH2_INVALID_SOCKET) {
         shutdown(ssh_sock, 2);
         LIBSSH2_SOCKET_CLOSE(ssh_sock);
