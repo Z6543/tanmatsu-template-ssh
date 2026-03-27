@@ -17,6 +17,7 @@
 #include "pax_gfx.h"
 #include "pax_codecs.h"
 #include "wifi_connection.h"
+#include "ethernet.h"
 #include "esp_heap_caps.h"
 #include "esp_timer.h"
 #include <libssh2.h>
@@ -496,21 +497,34 @@ void util_ssh(pax_buf_t* buffer, gui_theme_t* theme, ssh_settings_t* settings, u
     status_init(buffer);
     keyboard_backlight();
 
-    status_print("Connecting to WiFi...");
+    status_print("Checking network...");
     display_blit_buffer(buffer);
 
-    if (!wifi_stack_get_initialized()) {
-        ESP_LOGE(TAG, "WiFi stack not initialized");
-        message_dialog(get_icon(ICON_TERMINAL), "SSH: fatal error", "WiFi stack not initialized", "Quit");
-        return;
+    bool network_ready = false;
+
+    // Try WiFi if stack is initialized
+    if (wifi_stack_get_initialized()) {
+        if (wifi_connection_is_connected()) {
+            network_ready = true;
+        } else {
+            status_print("Connecting to WiFi...");
+            display_blit_buffer(buffer);
+            if (wifi_connect_try_all() == ESP_OK) {
+                network_ready = true;
+            }
+        }
     }
 
-    if (!wifi_connection_is_connected()) {
-        if (wifi_connect_try_all() != ESP_OK) {
-            ESP_LOGE(TAG, "Not connected to WiFi");
-            message_dialog(get_icon(ICON_TERMINAL), "SSH: fatal error", "Failed to connect to WiFi network", "Quit");
-            return;
-        }
+    // Fall back to Ethernet
+    if (!network_ready && ethernet_connected()) {
+        network_ready = true;
+    }
+
+    if (!network_ready) {
+        ESP_LOGE(TAG, "No network connection available");
+        message_dialog(get_icon(ICON_TERMINAL), "SSH: fatal error",
+                       "No network connection available", "Quit");
+        return;
     }
 
     status_print("Initialising libssh2...\n");

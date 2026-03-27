@@ -9,6 +9,7 @@ idf_component_register(
 		"main.c"
 		"common/display.c"
 		"common/theme.c"
+		"ethernet.c"
 		"icons.c"
 		"message_dialog.c"
 		"textedit.c"
@@ -28,7 +29,11 @@ idf_component_register(
 		"libvterm/src/unicode.c"
 		"libvterm/src/vterm.c"
 	PRIV_REQUIRES
+		driver
+		esp_eth
+		esp_event
 		esp_lcd
+		esp_netif
 		fatfs
 		sdmmc
 		esp_driver_sdmmc
