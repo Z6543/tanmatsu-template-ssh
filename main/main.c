@@ -8,7 +8,12 @@
 #include "common/theme.h"
 #include "custom_certificates.h"
 #include "driver/gpio.h"
+#include "esp_event.h"
 #include "esp_log.h"
+#include "esp_netif.h"
+#include "ethernet.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
 #include "nvs_flash.h"
 #include "pax_fonts.h"
 #include "pax_gfx.h"
@@ -80,7 +85,9 @@ void app_main(void) {
     QueueHandle_t input_event_queue = NULL;
     ESP_ERROR_CHECK(bsp_input_get_queue(&input_event_queue));
 
-    // Start WiFi stack
+    bool network_ok = false;
+
+    // Try WiFi first
     pax_background(fb, 0xFFFFFFFF);
     pax_draw_text(fb, 0xFF000000, pax_font_sky_mono, 16, 0, 0, "Connecting to radio...");
     display_blit_buffer(fb);
@@ -95,15 +102,52 @@ void app_main(void) {
         pax_background(fb, 0xFFFFFFFF);
         pax_draw_text(fb, 0xFF000000, pax_font_sky_mono, 16, 0, 0, "WiFi stack ready.");
         display_blit_buffer(fb);
+        network_ok = true;
     } else {
         bsp_power_set_radio_state(BSP_POWER_RADIO_STATE_OFF);
-        ESP_LOGE(TAG, "WiFi radio not responding, WiFi not available");
-        pax_background(fb, 0xFFFF0000);
-        pax_draw_text(fb, 0xFFFFFFFF, pax_font_sky_mono, 16, 0, 0, "WiFi unavailable");
-        display_blit_buffer(fb);
+        ESP_LOGW(TAG, "WiFi radio not responding");
     }
 
-    vTaskDelay(pdMS_TO_TICKS(500));
+    // Init netif/event loop if WiFi stack didn't do it
+    if (!wifi_initialized) {
+        esp_netif_init();
+        esp_event_loop_create_default();
+    }
+
+    // Try Ethernet (W5500 on J4 PMOD) if available
+    if (!network_ok) {
+        pax_background(fb, 0xFFFFFFFF);
+        pax_draw_text(fb, 0xFF000000, pax_font_sky_mono, 16, 0, 0, "Trying Ethernet...");
+        display_blit_buffer(fb);
+    }
+    esp_err_t eth_res = ethernet_init();
+    if (eth_res == ESP_OK) {
+        ESP_LOGI(TAG, "Ethernet initialized, waiting for IP...");
+        if (!network_ok) {
+            for (int i = 0; i < 50 && !ethernet_connected(); i++) {
+                vTaskDelay(pdMS_TO_TICKS(100));
+            }
+            if (ethernet_connected()) {
+                ESP_LOGI(TAG, "Ethernet connected");
+                pax_background(fb, 0xFFFFFFFF);
+                pax_draw_text(fb, 0xFF000000, pax_font_sky_mono, 16, 0, 0, "Ethernet connected.");
+                display_blit_buffer(fb);
+                network_ok = true;
+            }
+        }
+    } else if (eth_res != ESP_ERR_NOT_FOUND) {
+        ESP_LOGW(TAG, "Ethernet init failed: %s", esp_err_to_name(eth_res));
+    }
+
+    if (!network_ok) {
+        pax_background(fb, 0xFFFF0000);
+        pax_draw_text(fb, 0xFFFFFFFF, pax_font_sky_mono, 16, 0, 0, "No network available");
+        display_blit_buffer(fb);
+        ESP_LOGW(TAG, "No network connectivity");
+        vTaskDelay(pdMS_TO_TICKS(2000));
+    } else {
+        vTaskDelay(pdMS_TO_TICKS(500));
+    }
 
     // Launch SSH connection menu
     gui_theme_t* theme = get_theme();
