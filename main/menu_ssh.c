@@ -22,6 +22,12 @@
 static char const TAG[] = "menu_ssh";
 
 static bool populate_menu_from_ssh_entries(menu_t* menu) {
+    // Repopulate from NVS: drop any existing rows first so callers can invoke
+    // this after add/edit/delete without duplicating entries.
+    size_t previous_position = menu_get_position(menu);
+    while (menu_get_length(menu) > 0) {
+        menu_remove_item(menu, 0);
+    }
     bool empty = true;
     for (uint32_t index = 0; index < SSH_SETTINGS_MAX; index++) {
         ssh_settings_t settings;
@@ -30,6 +36,12 @@ static bool populate_menu_from_ssh_entries(menu_t* menu) {
             menu_insert_item(menu, (char*)settings.connection_name, NULL, (void*)index, -1);
             empty = false;
         }
+    }
+    if (menu_get_length(menu) > 0) {
+        if (previous_position >= menu_get_length(menu)) {
+            previous_position = menu_get_length(menu) - 1;
+        }
+        menu_set_position(menu, previous_position);
     }
     return !empty;
 }
@@ -128,12 +140,15 @@ void menu_ssh(pax_buf_t* buffer, gui_theme_t* theme) {
 				break;
                             case BSP_INPUT_NAVIGATION_KEY_F3:
                                 add_connection(buffer, theme);
+                                populate_menu_from_ssh_entries(&menu);
+                                render(buffer, theme, &menu, position, false, true, false, false);
                                 break;
                             case BSP_INPUT_NAVIGATION_KEY_F4:
                                 if (menu_find_item(&menu, 0) != NULL) {
                                     uint8_t index = (uint32_t)menu_get_callback_args(&menu, menu_get_position(&menu));
                                     menu_ssh_edit(buffer, theme, index, false);
-                                    render(buffer, theme, &menu, position, false, false, true, false);
+                                    populate_menu_from_ssh_entries(&menu);
+                                    render(buffer, theme, &menu, position, false, true, false, false);
                                 }
 				break;
                             case BSP_INPUT_NAVIGATION_KEY_F5:
@@ -151,7 +166,9 @@ void menu_ssh(pax_buf_t* buffer, gui_theme_t* theme) {
                                     adv_dialog_yes_no(get_icon(ICON_HELP), "Delete SSH connection", message_buffer);
                                 if (msg_ret == MSG_DIALOG_RETURN_OK) {
                                     ssh_settings_erase(index);
+                                    populate_menu_from_ssh_entries(&menu);
                                 }
+                                render(buffer, theme, &menu, position, false, true, false, false);
                             	break;
                             case BSP_INPUT_NAVIGATION_KEY_UP:
                                 menu_navigate_previous(&menu);

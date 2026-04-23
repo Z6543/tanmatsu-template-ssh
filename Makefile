@@ -1,4 +1,5 @@
 PORT ?= /dev/ttyACM0
+BADGELINKPORT ?= $(PORT)
 
 IDF_PATH ?= $(shell cat .IDF_PATH 2>/dev/null || echo `pwd`/esp-idf)
 IDF_TOOLS_PATH ?= $(shell cat .IDF_TOOLS_PATH 2>/dev/null || echo `pwd`/esp-idf-tools)
@@ -49,8 +50,58 @@ export IDF_GITHUB_ASSETS
 .PHONY: all
 all: build flash
 
+# Badgelink
+
+# Determine badgelink connection argument: --tcp for host:port, --port for serial devices
+BADGELINK_CONN := $(if $(findstring :,$(BADGELINKPORT)),--tcp $(BADGELINKPORT),--port $(BADGELINKPORT))
+
+.PHONY: badgelink
+badgelink:
+	rm -rf badgelink
+	git clone https://github.com/badgeteam/esp32-component-badgelink.git badgelink
+	cd badgelink/tools; ./install.sh
+
+APP_SLUG ?= us.hamilton.ssh
+APP_NAME ?= SSH
+APP_REVISION ?= 1
+APP_INSTALL_BASE_PATH ?= /int/apps/
+APP_INSTALL_PATH = $(APP_INSTALL_BASE_PATH)$(APP_SLUG)
+
 .PHONY: install
-install: flash
+install: build
+	@echo "=== Installing application ==="
+	@echo "Creating directory $(APP_INSTALL_PATH)..."
+	cd badgelink/tools; ./badgelink.sh $(BADGELINK_CONN) fs mkdir $(APP_INSTALL_PATH) || true
+	@echo "Uploading metadata.json..."
+	cd badgelink/tools; ./badgelink.sh $(BADGELINK_CONN) fs upload $(APP_INSTALL_PATH)/metadata.json ../../metadata/metadata.json
+	@echo "Uploading icon16.png..."
+	cd badgelink/tools; ./badgelink.sh $(BADGELINK_CONN) fs upload $(APP_INSTALL_PATH)/icon16.png ../../metadata/icon16.png
+	@echo "Uploading icon32.png..."
+	cd badgelink/tools; ./badgelink.sh $(BADGELINK_CONN) fs upload $(APP_INSTALL_PATH)/icon32.png ../../metadata/icon32.png
+	@echo "Uploading icon64.png..."
+	cd badgelink/tools; ./badgelink.sh $(BADGELINK_CONN) fs upload $(APP_INSTALL_PATH)/icon64.png ../../metadata/icon64.png
+	@echo "Uploading tanmatsu-ssh.bin..."
+	cd badgelink/tools; ./badgelink.sh $(BADGELINK_CONN) fs upload $(APP_INSTALL_PATH)/tanmatsu-ssh.bin ../../$(BUILD)/tanmatsu-ssh.bin
+	@echo "Caching tanmatsu-ssh.bin into AppFS as $(APP_SLUG)..."
+	cd badgelink/tools; ./badgelink.sh $(BADGELINK_CONN) appfs upload $(APP_SLUG) "$(APP_NAME)" $(APP_REVISION) ../../$(BUILD)/tanmatsu-ssh.bin
+	@echo "=== Installation complete ==="
+
+.PHONY: run
+run:
+	cd badgelink/tools; ./badgelink.sh $(BADGELINK_CONN) start $(APP_SLUG)
+
+APP_REPO_PATH ?= ../tanmatsu-app-repository/$(APP_SLUG)
+
+.PHONY: apprepo
+apprepo: build
+	@echo "=== Updating app repository ==="
+	mkdir -p $(APP_REPO_PATH)
+	cp metadata/metadata.json $(APP_REPO_PATH)/metadata.json
+	cp metadata/icon16.png $(APP_REPO_PATH)/icon16.png
+	cp metadata/icon32.png $(APP_REPO_PATH)/icon32.png
+	cp metadata/icon64.png $(APP_REPO_PATH)/icon64.png
+	cp $(BUILD)/tanmatsu-ssh.bin $(APP_REPO_PATH)/tanmatsu-ssh.bin
+	@echo "=== App repository updated at $(APP_REPO_PATH) ==="
 
 # Preparation
 

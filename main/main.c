@@ -11,7 +11,8 @@
 #include "esp_event.h"
 #include "esp_log.h"
 #include "esp_netif.h"
-#include "ethernet.h"
+#include "zh4ck_w5500_ethernet.h"
+#include "usb_keyboard.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "nvs_flash.h"
@@ -23,6 +24,12 @@
 #include "sdcard.h"
 
 static char const TAG[] = "main";
+
+// Bridge naming mismatch between esp-hosted and tanmatsu-wifi components
+extern esp_err_t hosted_sdio_reset_slave_callback(void);
+int              hosted_reset_slave_callback(void) {
+                 return (int)hosted_sdio_reset_slave_callback();
+}
 
 bool wifi_initialized = false;
 
@@ -92,6 +99,12 @@ void app_main(void) {
     pax_draw_text(fb, 0xFF000000, pax_font_sky_mono, 16, 0, 0, "Connecting to radio...");
     display_blit_buffer(fb);
 
+    // Power-cycle the radio coprocessor: if a previous app left it in
+    // APPLICATION mode with a transfer in flight, bringing it up without a
+    // reset produces an inconsistent state that crashes shortly after launch.
+    bsp_power_set_radio_state(BSP_POWER_RADIO_STATE_OFF);
+    vTaskDelay(pdMS_TO_TICKS(200));
+
     if (wifi_remote_initialize() == ESP_OK) {
         pax_background(fb, 0xFFFFFFFF);
         pax_draw_text(fb, 0xFF000000, pax_font_sky_mono, 16, 0, 0, "Starting WiFi stack...");
@@ -147,6 +160,12 @@ void app_main(void) {
         vTaskDelay(pdMS_TO_TICKS(2000));
     } else {
         vTaskDelay(pdMS_TO_TICKS(500));
+    }
+
+    // Start USB keyboard support (non-fatal if no device attached)
+    esp_err_t usb_res = usb_keyboard_init();
+    if (usb_res != ESP_OK) {
+        ESP_LOGW(TAG, "USB keyboard init failed: %s", esp_err_to_name(usb_res));
     }
 
     // Launch SSH connection menu

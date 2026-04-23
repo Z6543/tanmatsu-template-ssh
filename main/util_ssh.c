@@ -17,7 +17,7 @@
 #include "pax_gfx.h"
 #include "pax_codecs.h"
 #include "wifi_connection.h"
-#include "ethernet.h"
+#include "zh4ck_w5500_ethernet.h"
 #include "esp_heap_caps.h"
 #include "esp_timer.h"
 #include <libssh2.h>
