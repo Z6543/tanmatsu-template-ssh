@@ -110,9 +110,10 @@ static void menu_populate(menu_t* menu, ssh_settings_t* settings, uint8_t index)
     //ESP_LOGI(TAG, "auth_mode: %s", temp);
     //menu_insert_item_value(menu, "Auth Mode", temp, NULL, (void*)ACTION_AUTH_MODE, -1);
 
-    memset(temp, 0, sizeof(temp)); // don't display the password
+    // Placeholder so the user can tell whether a password is stored without revealing it.
     ESP_LOGI(TAG, "password: <redacted>");
-    menu_insert_item_value(menu, "Password", temp, NULL, (void*)ACTION_PASSWORD, -1);
+    const char* password_display = (settings->password[0] != '\0') ? "********" : "";
+    menu_insert_item_value(menu, "Password", password_display, NULL, (void*)ACTION_PASSWORD, -1);
 
     // Show private key status (read-only, set via badgelink)
     bool has_key = ssh_settings_has_private_key(index);
@@ -134,7 +135,7 @@ static void edit_connection_name(pax_buf_t* buffer, gui_theme_t* theme, menu_t* 
     memcpy(temp, settings->connection_name, sizeof(settings->connection_name));
     ESP_LOGI(TAG, "fetched connection_name: %s", settings->connection_name);
 
-    menu_textedit(buffer, theme, "Connection Name", temp, sizeof(settings->connection_name) + sizeof('\0'), true, &accepted);
+    menu_textedit(buffer, theme, "Connection Name", temp, sizeof(settings->connection_name) + 1, true, &accepted);
     if (accepted) {
         memcpy(settings->connection_name, temp, sizeof(settings->connection_name));
         ESP_LOGI(TAG, "updated connection_name: %s", settings->connection_name);
@@ -150,7 +151,7 @@ static void edit_dest_host(pax_buf_t* buffer, gui_theme_t* theme, menu_t* menu, 
     memcpy(temp, settings->dest_host, sizeof(settings->dest_host));
     ESP_LOGI(TAG, "fetched dest_host: %s", settings->dest_host);
 
-    menu_textedit(buffer, theme, "Host", temp, sizeof(settings->dest_host) + sizeof('\0'), true, &accepted);
+    menu_textedit(buffer, theme, "Host", temp, sizeof(settings->dest_host) + 1, true, &accepted);
     if (accepted) {
         memcpy(settings->dest_host, temp, sizeof(settings->dest_host));
         ESP_LOGI(TAG, "updated dest_host: %s", settings->dest_host);
@@ -166,7 +167,7 @@ static void edit_dest_port(pax_buf_t* buffer, gui_theme_t* theme, menu_t* menu, 
     memcpy(temp, settings->dest_port, sizeof(settings->dest_port));
     ESP_LOGI(TAG, "fetched dest_port: %s", settings->dest_port);
 
-    menu_textedit(buffer, theme, "Port", temp, sizeof(settings->dest_port) + sizeof('\0'), true, &accepted);
+    menu_textedit(buffer, theme, "Port", temp, sizeof(settings->dest_port) + 1, true, &accepted);
     if (accepted) {
         memcpy(settings->dest_port, temp, sizeof(settings->dest_port));
         ESP_LOGI(TAG, "updated dest_port: %s", settings->dest_port);
@@ -239,7 +240,7 @@ static void edit_username(pax_buf_t* buffer, gui_theme_t* theme, menu_t* menu, s
     memcpy(temp, settings->username, sizeof(settings->username));
     ESP_LOGI(TAG, "fetched username: %s", settings->username);
 
-    menu_textedit(buffer, theme, "Username", temp, sizeof(settings->username) + sizeof('\0'), true, &accepted);
+    menu_textedit(buffer, theme, "Username", temp, sizeof(settings->username) + 1, true, &accepted);
     if (accepted) {
         memcpy(settings->username, temp, sizeof(settings->username));
         ESP_LOGI(TAG, "updated username: %s", settings->username);
@@ -250,15 +251,19 @@ static void edit_username(pax_buf_t* buffer, gui_theme_t* theme, menu_t* menu, s
 static void edit_password(pax_buf_t* buffer, gui_theme_t* theme, menu_t* menu, ssh_settings_t* settings) {
     char temp[129] = {0};
     bool accepted  = false;
-    memset(temp, 0, sizeof(temp)); // don't display the password
-    ESP_LOGI(TAG, "fetched password: %s", settings->password);
+    // Pre-fill with the existing password so the user can verify and edit it,
+    // matching the behaviour of the other edit_* functions.
+    memcpy(temp, settings->password, sizeof(settings->password));
 
-    menu_textedit(buffer, theme, "Password", temp, sizeof(settings->password) + sizeof('\0'), true, &accepted);
+    menu_textedit(buffer, theme, "Password", temp, sizeof(settings->password) + 1, true, &accepted);
     if (accepted) {
+        memset(settings->password, 0, sizeof(settings->password));
         memcpy(settings->password, temp, sizeof(settings->password));
         ESP_LOGI(TAG, "updated password: <redacted>");
-        menu_set_value(menu, 4, temp);
+        menu_set_value(menu, 4, (settings->password[0] != '\0') ? "********" : "");
     }
+    // Wipe the local copy of the password from the stack.
+    memset(temp, 0, sizeof(temp));
 }
 
 bool menu_ssh_edit(pax_buf_t* buffer, gui_theme_t* theme, uint8_t index, bool new_entry) {

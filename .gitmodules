@@ -1,0 +1,3 @@
+[submodule "components/zh4ck-w5500-ethernet"]
+	path = components/zh4ck-w5500-ethernet
+	url = git@github.com:Z6543/zh4ck-w5500-ethernet.git

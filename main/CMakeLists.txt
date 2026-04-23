@@ -9,7 +9,7 @@ idf_component_register(
 		"main.c"
 		"common/display.c"
 		"common/theme.c"
-		"ethernet.c"
+		"usb_keyboard.c"
 		"icons.c"
 		"message_dialog.c"
 		"textedit.c"
@@ -30,7 +30,6 @@ idf_component_register(
 		"libvterm/src/vterm.c"
 	PRIV_REQUIRES
 		driver
-		esp_eth
 		esp_event
 		esp_lcd
 		esp_netif
@@ -42,11 +41,14 @@ idf_component_register(
 		badge-bsp
 		tanmatsu-wifi
 		lwip
+		usb
+		espressif__usb_host_hid
 		robotman2412__pax-gfx
 		robotman2412__pax-codecs
 		nicolaielectronics__wifi-manager
 		skuodi__libssh2_esp
 		gui
+		zh4ck-w5500-ethernet
 		${extra_requires}
 	INCLUDE_DIRS
 		"."
